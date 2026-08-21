@@ -35,11 +35,13 @@ was at the time. It is the headline because it is usually shocking:
 
 ```
   context         turns     tokens spent       output      burn
-  <50k           13,658      486,193,053    3,460,445      141x
-  100-200k       31,527    4,526,094,997   20,291,737      223x
-  400-600k        8,404    4,067,387,843    5,213,903      780x
-  >600k           4,935    3,672,059,325    2,555,971     1437x
+  <50k           13,000      480,000,000    3,400,000      140x
+  100-200k       31,000    4,500,000,000   20,000,000      225x
+  400-600k        8,000    4,000,000,000    5,200,000      770x
+  >600k           4,900    3,700,000,000    2,500,000     1440x
 ```
+
+(Illustrative shape, rounded. Your own numbers will differ; the curve rarely does.)
 
 Identical work costs an order of magnitude more late in a session than early. Not because the
 model got worse, but because every turn pays to re-read everything before it. Long-lived agents
@@ -92,11 +94,12 @@ must actually happen. Practitioners measure roughly 80% adherence, with rules si
 the file grows. So a `CLAUDE.md` rule is a probabilistic fix that costs tokens on every single
 turn, forever.
 
-A worked example. The most common systemic failure in the first corpus this tool was built
-against was `grep --include=*.ts`, which fails under zsh with `no matches found` because zsh
-treats an unmatched glob as an error where bash passes it through. 552 failures across 336
-agents. The `CLAUDE.md` fix would have been a rule about quoting globs, followed ~80% of the
-time, costing tokens on every turn. The actual fix was one line in `~/.zshrc`:
+A worked example. On the first corpus this tool ran against, the most common systemic failure by
+far was `grep --include=*.ts`, which dies under zsh with `no matches found` because zsh treats an
+unmatched glob as an error where bash passes it through. Hundreds of failures, spread across
+hundreds of separate agents, none of them noticed. The `CLAUDE.md` fix would have been a rule
+about quoting globs, followed maybe 80% of the time, costing tokens on every turn forever. The
+actual fix was one line in `~/.zshrc`:
 
 ```sh
 unsetopt nomatch
