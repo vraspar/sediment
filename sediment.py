@@ -148,7 +148,8 @@ def analyze(days=None):
     turns_by_bucket = collections.Counter()
     by_model = collections.Counter()
 
-    agents = collections.defaultdict(lambda: {"tokens": 0, "turns": 0, "peak": 0, "out": 0, "model": ""})
+    agents = collections.defaultdict(
+        lambda: {"tokens": 0, "turns": 0, "peak": 0, "out": 0, "model": "", "final_chars": 0})
     spawn_costs = []
 
     tool_bytes = collections.Counter()
@@ -215,6 +216,11 @@ def analyze(days=None):
                 rec_agent["out"] += out
                 rec_agent["peak"] = max(rec_agent["peak"], ctx)
                 rec_agent["model"] = msg.get("model", "")
+                body = msg.get("content")
+                if isinstance(body, list):
+                    rec_agent["final_chars"] = sum(
+                        len(b.get("text", "") or "")
+                        for b in body if isinstance(b, dict) and b.get("type") == "text")
 
         content = msg.get("content")
         if not isinstance(content, list):
@@ -324,6 +330,26 @@ def analyze(days=None):
     ]
     split_candidates.sort(key=lambda d: -d["wasted_tokens"])
 
+    # Dead ends: an agent that ran a long time and handed back almost nothing. Judge it by the
+    # size of its FINAL message, not by output summed over every turn — a long run produces plenty
+    # of output along the way and still delivers a two-line answer at the end.
+    dead_ends = [
+        {"turns": a["turns"], "tokens": a["tokens"], "final": a["final_chars"], "peak": a["peak"]}
+        for a in agents.values()
+        if a["turns"] >= 25 and a["final_chars"] < 800
+    ]
+    dead_ends.sort(key=lambda d: -d["tokens"])
+
+    # MCP servers cost context on every turn: their tool schemas sit in the prompt whether or not
+    # you call them. Calls are visible in transcripts; the schemas are not, so report usage and
+    # let the reader decide what is carrying its weight.
+    mcp_calls = collections.Counter()
+    for name, count in tool_calls.items():
+        if name.startswith("mcp__"):
+            parts = name.split("__")
+            mcp_calls[parts[1] if len(parts) > 1 else name] += count
+    total_tool_calls = sum(tool_calls.values())
+
     # Resolve the traces into loops and stalls.
     LOOP_MIN = 3      # an identical call this many times over is a loop, not a retry
     STALL_MIN = 25    # this many calls in a row without changing a file is spinning
@@ -365,6 +391,12 @@ def analyze(days=None):
             "ranged": read_ranged,
         },
         "split_candidates": split_candidates[:40],
+        "dead_ends": {
+            "count": len(dead_ends),
+            "tokens": sum(d["tokens"] for d in dead_ends),
+            "worst": dead_ends[0] if dead_ends else None,
+        },
+        "mcp": {"by_server": dict(mcp_calls), "total_tool_calls": total_tool_calls},
         "cmd_failures": dict(cmd_failures),
         "cmd_sessions": {k: len(v) for k, v in cmd_sessions.items()},
         "error_hits": dict(error_hits),
@@ -387,7 +419,7 @@ def fmt(n):
     return f"{int(n):,}"
 
 
-def report(data):
+def report(data, show_all=False):
     t = data["totals"]
     grand = sum(t.values())
     if not grand:
@@ -546,6 +578,24 @@ def report(data):
     if r["whole_file"] and 100 * r["whole_file"] / max(r["whole_file"] + r["ranged"], 1) > 50:
         recs.append("Most reads pull whole files. Adding a table of contents with line ranges to "
                     "your largest files lets an agent ask for the part it needs.")
+    dead = data.get("dead_ends") or {}
+    if dead.get("count") and side:
+        share = 100 * dead["tokens"] / max(side, 1)
+        recs.append(f"{dead['count']} agents ran 25+ turns and signed off with under 800 "
+                    f"characters, costing {fmt(dead['tokens'])} tokens ({share:.0f}% of subagent "
+                    f"spend). Work that thin either got abandoned or was redone somewhere else. "
+                    f"Read a few of them; the usual cause is a task that was never scoped tightly "
+                    f"enough to finish.")
+    mcp = data.get("mcp") or {}
+    if mcp.get("by_server"):
+        mcp_total = sum(mcp["by_server"].values())
+        share = 100 * mcp_total / max(mcp["total_tool_calls"], 1)
+        if share < 2:
+            servers = ", ".join(sorted(mcp["by_server"], key=lambda s: -mcp["by_server"][s])[:4])
+            recs.append(f"MCP tools were {share:.1f}% of your tool calls ({fmt(mcp_total)} of "
+                        f"{fmt(mcp['total_tool_calls'])}), across: {servers}. Every connected "
+                        f"server's tool schemas sit in your context on every turn whether you call "
+                        f"them or not. Disconnect the ones you are not using per project.")
     if loops["total_repeats"] > 50:
         top = loops["signatures"][0] if loops["signatures"] else ("", 0)
         recs.append(f"{loops['total_repeats']:,} redundant calls came from agents repeating an "
@@ -582,8 +632,12 @@ def report(data):
                     f"Read-only exploration rarely needs your largest model.")
     if not recs:
         recs.append("Nothing above the alarm thresholds. Your setup looks healthy.")
-    for i, rec in enumerate(recs, 1):
+    shown = recs if show_all else recs[:6]
+    for i, rec in enumerate(shown, 1):
         print(f"\n  {i}. {rec}")
+    if len(recs) > len(shown):
+        print(f"\n  ...and {len(recs) - len(shown)} smaller findings. Run with --all to see them, "
+              f"or fix these first and re-run.")
     print()
 
 
@@ -591,10 +645,11 @@ def main():
     ap = argparse.ArgumentParser(description="Find out where your Claude Code tokens actually go.")
     ap.add_argument("--days", type=int, help="only look at the last N days")
     ap.add_argument("--json", metavar="PATH", help="also write raw findings as JSON")
+    ap.add_argument("--all", action="store_true", help="show every recommendation, not just the top 6")
     args = ap.parse_args()
 
     data = analyze(args.days)
-    report(data)
+    report(data, show_all=args.all)
 
     if args.json:
         serializable = dict(data)
