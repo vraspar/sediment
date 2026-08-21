@@ -66,7 +66,7 @@ A finding that is worth acting on names all four of these. If any is missing, pu
 
 | | example |
 |---|---|
-| The evidence | "552 failures across 336 agents" |
+| The evidence | "hundreds of failures, across hundreds of agents" |
 | The root cause | "zsh errors on unmatched globs; bash passes them through" |
 | The mechanism | "shell config, not a docs line, because docs are ~80% adhered to" |
 | The change | "`unsetopt nomatch` in `~/.zshrc`" |
