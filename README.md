@@ -4,23 +4,24 @@ Find out where your Claude Code tokens go, then turn the waste into fixes.
 
 ## Copy This Into Claude Code
 
-Open the repo you want to improve, then paste:
+Paste this into Claude Code. Run it wherever you can act on the most findings:
 
 ```text
-Use sediment to audit my Claude Code history and find fixes for this repo.
+Audit my Claude Code history end to end and tell me what to change.
 
 Run:
 tmp=$(mktemp -d)
 git clone https://github.com/vraspar/sediment "$tmp/sediment"
 python3 "$tmp/sediment/sediment.py" --json findings.json
 
-sediment reads Claude Code history across every project on this machine. Some
-findings may belong to other repos. Use those as context only. Propose changes
-only for this repo, and say when a finding does not apply here.
+sediment reads every project on this machine, so the findings are about how I
+work, not about one repo. Group them by where the fix belongs: my shell or
+environment, a particular repo, or how I run agents. Say which repo each one is
+for. Make the changes you can reach from here and list the rest.
 
 Use findings.json and the printed report. For each recommendation, show:
-- the sediment evidence
-- what you checked in this repo
+- the sediment evidence, including what it cost
+- what you checked, and where
 - the smallest fix that should work
 
 Prefer fixing code, environment, hooks, or lint rules over adding more agent
@@ -28,8 +29,12 @@ instructions. If a docs change is still the best fix, replace stale text instead
 of appending another warning.
 ```
 
-That is the fastest path. The agent will clone `sediment`, run it, read the
-report, and turn the findings into a repo-specific plan.
+That is the fastest path. The agent clones `sediment`, runs it, reads the report,
+and turns the findings into a plan.
+
+sediment audits **all** of your Claude Code history, every project on the
+machine. That is the point: recurring failures, long-lived agents and context
+habits are properties of how you work, not of one repo.
 
 For a stricter review workflow, use [`PROMPT.md`](./PROMPT.md).
 

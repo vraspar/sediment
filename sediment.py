@@ -66,6 +66,11 @@ ERROR_PATTERNS = [
     ("edit target missing", r"String to replace not found|has not been read yet|old_string"),
 ]
 
+# Commands that exit non-zero to mean "no match" rather than "something broke". The harness
+# marks those results as errors, which buries real failures under searches that found nothing.
+EXIT_1_IS_NORMAL = {"grep", "rg", "egrep", "fgrep", "find", "diff", "test", "cmp", "ag", "ack"}
+
+
 # Tool calls that change something. Used to tell real progress from spinning.
 PRODUCTIVE_TOOLS = {"Edit", "Write", "NotebookEdit", "MultiEdit"}
 
@@ -186,6 +191,15 @@ def analyze(days=None):
     read_tokens_by_file = collections.Counter()   # path -> tokens returned across all reads
     read_counts_by_file = collections.Counter()   # path -> how many reads returned content
 
+    # Downstream cost. When a finding appears, remember the agent and how much it had spent, then
+    # bill it for what that agent spends over its next few turns. This is attribution, not proof:
+    # some of that spend would have happened anyway.
+    DOWNSTREAM_TURNS = 5
+    pending = collections.defaultdict(list)      # agent -> [(label, turns_left, spend_at_start)]
+    downstream = collections.Counter()           # label -> tokens spent after it appeared
+    examples = {}                                # label -> one real sample, for the report
+    agent_spend = collections.Counter()          # agent -> running total
+
     cmd_failures = collections.Counter()
     cmd_sessions = collections.defaultdict(set)
     error_hits = collections.Counter()
@@ -237,6 +251,14 @@ def analyze(days=None):
                 rec_agent = agents[agent_key]
                 if rec_agent["turns"] == 0:
                     spawn_costs.append(ctx)
+                agent_spend[agent_key] += spent
+                still = []
+                for label, left, at_start in pending[agent_key]:
+                    if left > 1:
+                        still.append((label, left - 1, at_start))
+                    else:
+                        downstream[label] += agent_spend[agent_key] - at_start
+                pending[agent_key] = still
                 rec_agent["tokens"] += spent
                 rec_agent["turns"] += 1
                 rec_agent["out"] += out
@@ -314,17 +336,32 @@ def analyze(days=None):
                     read_counts_by_file[path] += 1
 
                 is_error = block.get("is_error") or False
+                shape = None
                 if is_error and name == "Bash":
                     shape = normalize_command((tool_inputs.get(tid) or {}).get("command", ""))
-                    cmd_failures[shape] += 1
-                    cmd_sessions[shape].add(sid)
+                    if shape.split()[0] in EXIT_1_IS_NORMAL and not text.strip():
+                        # A search that printed nothing and exited non-zero found nothing.
+                        is_error = False
+                        shape = None
+                    else:
+                        cmd_failures[shape] += 1
+                        cmd_sessions[shape].add(sid)
                 if text and is_error:
                     head = text[:4000]
                     for label, pattern in ERROR_PATTERNS:
-                        if re.search(pattern, head):
+                        found = re.search(pattern, head)
+                        if found:
                             error_hits[label] += 1
                             error_sessions[label].add(sid)
+                            pending[agent_key].append(
+                                (label, DOWNSTREAM_TURNS, agent_spend[agent_key]))
+                            if label not in examples:
+                                line = next((ln.strip() for ln in head.splitlines()
+                                             if found.group(0)[:20] in ln), found.group(0))
+                                examples[label] = line[:110]
                             break
+                if shape and shape not in examples:
+                    examples[shape] = ((tool_inputs.get(tid) or {}).get("command", ""))[:110]
 
     reread = sum(sum(c - 1 for c in files.values() if c > 1) for files in reads_per_agent.values())
     total_reads = sum(sum(files.values()) for files in reads_per_agent.values())
@@ -363,7 +400,9 @@ def analyze(days=None):
          "agents": len(g["agents"]), "avg_tokens": g["avg"],
          "wasted_tokens": g["tokens"], "checkouts": len(g["copies"])}
         for key, g in grouped.items()
-        if g["rereads"] >= 3 and len(g["agents"]) >= 2 and g["avg"] >= 400
+        # avg is the tokens a single read returned. A small file is cheap to re-read and
+        # splitting it would not help, however many checkouts of it exist.
+        if g["rereads"] >= 3 and len(g["agents"]) >= 2 and g["avg"] >= 2_000
     ]
     split_candidates.sort(key=lambda d: -d["wasted_tokens"])
 
@@ -440,6 +479,8 @@ def analyze(days=None):
         "mcp": {"by_server": dict(mcp_calls), "total_tool_calls": total_tool_calls},
         "cmd_failures": dict(cmd_failures),
         "cmd_sessions": {k: len(v) for k, v in cmd_sessions.items()},
+        "downstream": dict(downstream),
+        "examples": dict(examples),
         "error_hits": dict(error_hits),
         "error_sessions": {k: len(v) for k, v in error_sessions.items()},
         "loops": {
@@ -570,14 +611,28 @@ def report(data):
         print("  'wasted' is tokens spent on reads after the first, which is what a split recovers.")
 
     if data["cmd_failures"]:
+        eg = data.get("examples") or {}
         print("\n  Failing command shapes:")
         for shape, n in sorted(data["cmd_failures"].items(), key=lambda kv: -kv[1])[:8]:
             print(f"    {n:>5} failures across {data['cmd_sessions'].get(shape,0):>3} sessions   {shape}")
+            if eg.get(shape):
+                print(f"          e.g. {eg[shape]}")
 
     if data["error_hits"]:
-        print("\n  Error signatures:")
-        for label, n in sorted(data["error_hits"].items(), key=lambda kv: -kv[1])[:10]:
-            print(f"    {n:>5} hits across {data['error_sessions'].get(label,0):>3} sessions   {label}")
+        down = data.get("downstream") or {}
+        eg = data.get("examples") or {}
+        print("\n  Error signatures, by what the agent spent in the 5 turns after each:")
+        ranked = sorted(data["error_hits"].items(), key=lambda kv: -down.get(kv[0], 0))
+        for label, n in ranked[:8]:
+            cost = down.get(label, 0)
+            print(f"    {fmt(cost):>14} tok  {n:>5} hits / {data['error_sessions'].get(label,0):>3} "
+                  f"sessions   {label}")
+            if eg.get(label):
+                print(f"                     e.g. {eg[label]}")
+        total_down = sum(down.get(k, 0) for k in data["error_hits"])
+        if grand:
+            print(f"\n  All error signatures together: {fmt(total_down)} tokens, "
+                  f"{100*total_down/grand:.1f}% of everything. Attribution, not proof.")
 
     # Loops and stalls.
     loops = data["loops"]
