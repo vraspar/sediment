@@ -2,38 +2,88 @@
 
 Find out where your Claude Code tokens actually go.
 
-Claude Code writes a full transcript of every session to `~/.claude/projects`. Nobody reads
-them. `sediment` reads all of them and reports what you paid for, then hands you a prompt that
-turns those findings into changes to your repo.
+Claude Code already writes session transcripts to `~/.claude/projects`. `sediment`
+reads those local transcripts and turns them into a token audit: where spend
+accumulates, which agents got bloated, which commands keep failing, and which
+patterns are likely wasting context.
 
-It runs entirely on your machine. **No network calls, no API key, no account, no dependencies.**
-It reads your transcripts and prints numbers; it never uploads them anywhere.
+It is deliberately small: one Python file, no install step, no dependencies, no
+network calls, no API key, and no account. It reads transcripts on your machine
+and prints a report.
 
-## Requirements
+## Quick Start
 
-- Python 3.8 or newer. Nothing to install.
-- Transcripts at `~/.claude/projects`, which Claude Code creates on its own. If that directory is
-  missing or empty, `sediment` says so and exits rather than printing an empty report.
-- A few seconds to a minute, depending on how much history you have. Roughly 10 seconds per
-  gigabyte of transcripts.
-
-## Usage
+Run the audit:
 
 ```bash
 python3 sediment.py
 ```
 
-That prints the whole report. Two flags change what it covers:
+For a recent window:
 
-| flag | what it does |
-|---|---|
-| `--days N` | Only look at the last N days. Useful for checking whether a change helped. |
-| `--json PATH` | Also write the raw findings to a JSON file, for handing to an agent. |
-
-The report has five parts: a token summary, the burn-ratio table, subagent concentration, waste
-signals, and a ranked list of what to do. Abridged sample:
-
+```bash
+python3 sediment.py --days 14
 ```
+
+To hand the raw findings to an agent:
+
+```bash
+python3 sediment.py --json findings.json
+```
+
+If Claude Code has not written any transcripts under `~/.claude/projects`,
+`sediment` will say so and exit.
+
+`sediment` needs Python 3.8 or newer. Runtime depends on transcript size; a
+large history usually takes a few seconds to a minute, roughly 10 seconds per
+gigabyte.
+
+## Copy-Paste Prompt
+
+Paste this into Claude Code from the repo you want to improve:
+
+```text
+Use sediment to audit this repo's Claude Code token history end to end.
+
+Run:
+tmp=$(mktemp -d)
+git clone https://github.com/vraspar/sediment "$tmp/sediment"
+python3 "$tmp/sediment/sediment.py" --json findings.json
+
+Then use findings.json and the printed sediment report to find concrete fixes in
+this repo. Do not give me generic agent best practices. Tie every recommendation
+to evidence from sediment, then confirm it against this codebase before proposing
+a change. Prefer fixing the environment, code, hooks, or lint rules over adding
+more agent instructions. If a docs change is still the cheapest working fix,
+rewrite the stale instruction in place instead of appending a correction.
+```
+
+For a more thorough version, use [`PROMPT.md`](./PROMPT.md). It walks the agent
+through confirming findings, checking agent-facing docs, finding oversized files,
+and ranking fixes.
+
+## What The Report Shows
+
+`sediment` focuses on the parts of agent work that usually hide in plain sight:
+
+- **Burn ratio:** tokens spent per token of output, grouped by context size.
+  This shows how much more expensive a long-lived agent becomes as its context
+  fills up.
+- **Cache health:** cache reads, cache writes, fresh input, and output share.
+  A high cache hit rate means caching is not the bottleneck.
+- **Subagent concentration:** how many sidechain agents ran, how expensive the
+  largest ones were, and whether a fresh spawn would have been cheaper than
+  another turn in a bloated context.
+- **Loops and stalls:** repeated identical tool calls, plus long stretches of
+  tool use where the agent did not edit anything.
+- **Waste signals:** repeated file reads, whole-file reads, recurring failing
+  command shapes, and error signatures that show up across sessions.
+- **Recommendations:** thresholded suggestions based on your numbers rather
+  than a generic checklist.
+
+Example, shortened:
+
+```text
 ==========================================================================
   SEDIMENT    2026-07-09 to 2026-08-21
 ==========================================================================
@@ -41,6 +91,7 @@ signals, and a ranked list of what to do. Abridged sample:
 Total tokens processed: 21,500,000,000
   cache reads     20,000,000,000   93.0%
   cache writes     1,440,000,000    6.7%
+  fresh input          8,000,000    0.0%
   output              62,000,000    0.3%
 
 Cache hit rate: 93.3%  (above ~85% means caching is not your problem)
@@ -62,93 +113,63 @@ Subagents:      66% of all tokens
 --------------------------------------------------------------------------
   117 of 416 agents repeated an identical call 3+ times.
   229 agents went 25+ consecutive tool calls without editing a file.
-  Longest such stretch: 436 calls with nothing changed.
 ```
 
-(Numbers rounded for the example. Yours will differ; the shape of the burn curve usually
-doesn't.)
+## How To Read It
 
-## Turning findings into fixes
+Start with the biggest pools of wasted spend:
 
-The report tells you what happened. [`PROMPT.md`](./PROMPT.md) turns it into a plan.
+1. **Spend above 200k context.** If this is a large share of total spend,
+   lifecycle is probably the main lever. Checkpoint long-running work to a file,
+   branch, or PR, then hand off to a fresh agent.
+2. **Recurring errors across sessions.** These are usually cheap to fix and
+   easy to miss. A command that fails in many sessions is a systems problem, not
+   one unlucky run.
+3. **Loops and stalls.** Repeated identical calls often mean the agent could not
+   tell whether the call succeeded. Long no-edit stretches often mean it lost
+   the thread and kept searching.
+4. **Re-reads and whole-file reads.** If the same files keep getting read in
+   full, they may be too large or poorly structured for narrow questions.
 
-```bash
-python3 sediment.py --json findings.json
+The goal is not to make every number small. Some expensive sessions are worth it.
+The goal is to find spend that repeats without buying better work.
+
+## Fix Root Causes
+
+When a finding points to a recurring failure, avoid the reflex to add another
+line to `CLAUDE.md` or `AGENTS.md`.
+
+Agent-facing docs are context, not enforcement. They also cost tokens every time
+they are loaded. Prefer fixes in this order:
+
+1. Fix the environment.
+2. Fix the code.
+3. Add a hook.
+4. Add a lint or test rule.
+5. Rewrite the doc only if documentation is still the cheapest reliable fix.
+
+If you do edit docs, replace stale instructions in place. Do not leave a
+correction next to the old mistake.
+
+## Options
+
+```text
+--days N     only analyze transcripts from the last N days
+--json PATH  write raw findings as JSON as well as printing the report
 ```
-
-Then open `PROMPT.md`, copy the prompt inside it, and paste it into Claude Code **in the repo you
-actually work in**, together with `findings.json` and the printed report. The agent can then read
-both your findings and the codebase they describe.
-
-What comes back is a ranked list of changes, each tied to the evidence that justifies it, with
-the cheapest working fix for each. `PROMPT.md` also makes the agent confirm findings before
-acting on them, because some are artifacts of pattern-matching, and acting on a misattributed
-finding wastes more time than it saves.
-
-## What it reports
-
-**The burn ratio.** Tokens spent per token of output, bucketed by how full the context window was
-at the time. It rises roughly an order of magnitude over a long session, because every turn pays
-to re-read everything before it. Long-lived agents get expensive even when they are behaving
-correctly.
-
-**Cache health.** Hit rate, and how much of your traffic is cache reads versus fresh input.
-
-**Subagent concentration.** How many agents ran, what the worst ten cost, and how many grew past
-200k context. It prints the cost of a cold start next to the cost of one turn of your largest
-agent, which is the comparison that decides whether to reuse agents or replace them.
-
-**Loops and stalls.** Agents that made the same call three or more times, and agents that ran long
-stretches of tool calls without changing a file. Editing one file repeatedly is normal iterative
-work and is not counted as a loop.
-
-**Waste signals.** How often agents re-read a file they had already read, how often they pull a
-whole file with no line range, which command shapes keep failing, and which errors recur. An error
-across many sessions is systemic; an error in one session is bad luck.
-
-**Recommendations**, thresholded against your own numbers rather than drawn from a list of general
-advice.
-
-## Reading the output
-
-In rough order of how much money is usually involved:
-
-1. **Spend above 200k context.** If this is over a third of your total, agent lifecycle is your
-   biggest lever and nothing else is close. Have long-running agents checkpoint to a file, a
-   branch, or a PR and hand off to a fresh one. A cold start typically costs about 27k tokens; one
-   turn of a bloated agent can cost a million.
-2. **Errors that span many sessions.** Usually cheap to fix, and almost never fixed, because
-   nobody knew they were happening.
-3. **Loops and stalls.** A repeated identical call usually means the agent could not tell whether
-   the call worked. A long stall usually means it lost the thread and kept searching.
-4. **Re-read rate.** Often means a file is too big to answer one question, so it gets re-read
-   rather than remembered. Split the files that show up most.
-5. **Whole-file reads.** A table of contents with line ranges lets an agent ask for the part it
-   needs.
-
-## Fix things at the root, not in a docs file
-
-When you find a recurring failure, the reflex is to add a line to `CLAUDE.md`. Resist it when
-something better exists. Anthropic's documentation says these files are treated as "context, not
-enforced configuration," with "no guarantee of strict compliance," and recommends hooks when
-something must actually happen. A `CLAUDE.md` rule is a probabilistic fix that costs tokens on
-every turn, forever.
-
-Prefer, in order: fix the environment, fix the code, add a hook, add a lint rule, then write a doc
-line. `PROMPT.md` makes the agent justify going further down that list.
 
 ## Limitations
 
-- Downstream burn after an error is **attribution, not causation**. Some of that spend would have
-  happened anyway.
-- Error detection is regex over tool output. It misses failures that do not announce themselves,
-  and occasionally matches source code that merely discusses an error.
-- Several signatures often share one root cause, so fixing one thing can move several numbers and
-  the savings do not simply add up.
-- Token counts come from the usage records Claude Code writes. They are what the API reported, not
-  a re-tokenization.
-- It measures cost, not value. A session that burned a lot and shipped something important is not a
-  problem. Read the numbers next to what you were actually doing.
+- Downstream burn after an error is attribution, not proof that the error caused
+  all later spend.
+- Error detection is regex-based. It can miss quiet failures and occasionally
+  match text that only discusses an error.
+- Several signatures can share one root cause, so estimated savings do not add
+  up cleanly.
+- Token counts come from Claude Code usage records. `sediment` does not
+  re-tokenize transcripts.
+- It measures cost, not value. Read the numbers next to what the agent actually
+  accomplished.
 
 ## License
 
