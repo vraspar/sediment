@@ -36,19 +36,38 @@ BUCKETS = [
 ]
 
 # Error signatures worth attributing downstream burn to. Ordered most to least specific
-# so the first match wins.
+# so the first match wins. Deliberately spans several ecosystems: the point is to work on
+# somebody else's stack, not only the one this was written against.
 ERROR_PATTERNS = [
-    ("zsh unmatched glob", r"no matches found:|\(eval\):\d+:"),
-    ("vitest failure", r"FAIL\s+\S+|Tests?\s+\d+\s+failed"),
-    ("npm/pnpm script failure", r"ELIFECYCLE|command failed with exit code"),
-    ("typecheck error", r"error TS\d{4}"),
-    ("docker/testcontainers", r"testcontainer|docker.*(daemon|not running)|Could not find a working container"),
-    ("file not found", r"No such file or directory"),
-    ("command timed out", r"command timed out|timed out after"),
-    ("permission denied", r"[Pp]ermission denied|requires approval|classifier"),
-    ("git worktree exists", r"already exists|is already checked out"),
-    ("edit target missing", r"String to replace not found|has not been read yet"),
+    # Shell and environment
+    ("shell glob not expanded", r"no matches found:|nomatch|bad pattern:"),
+    ("command not found", r"command not found|is not recognized as an internal"),
+    ("permission / approval", r"[Pp]ermission denied|requires approval|EACCES|not permitted"),
+    ("file not found", r"No such file or directory|ENOENT"),
+    ("command timed out", r"command timed out|timed out after|ETIMEDOUT"),
+    ("port already in use", r"EADDRINUSE|address already in use|port .* already"),
+    # Test runners, several ecosystems
+    ("test failure (js)", r"FAIL\s+\S+|Tests?:\s+\d+\s+failed|✕ |● .*›"),
+    ("test failure (python)", r"=+ FAILURES =+|\d+ failed,|E\s+assert |pytest"),
+    ("test failure (go)", r"^--- FAIL|FAIL\s+\S+\s+\d+\.\d+s"),
+    ("test failure (rust/other)", r"test result: FAILED|thread '.*' panicked"),
+    # Build and type systems
+    ("type error", r"error TS\d{4}|mypy: |error\[E\d+\]|type error:"),
+    ("lint failure", r"\d+ problems? \(\d+ error|eslint|ruff|rubocop.*offense"),
+    ("package script failure", r"ELIFECYCLE|command failed with exit code|npm ERR!|make: \*\*\*"),
+    ("dependency resolution", r"ERESOLVE|could not resolve dependency|version solving failed"),
+    # Infra
+    ("container / docker", r"testcontainer|docker.*(daemon|not running)|Cannot connect to the Docker"),
+    ("database connection", r"ECONNREFUSED.*(5432|3306|27017)|could not connect to server|connection refused"),
+    # Version control
+    ("git conflict or dirty tree", r"CONFLICT|would be overwritten|Your local changes"),
+    ("git worktree/branch exists", r"already exists|is already checked out"),
+    # Agent-harness specific
+    ("edit target missing", r"String to replace not found|has not been read yet|old_string"),
 ]
+
+# Tool calls that change something. Used to tell real progress from spinning.
+PRODUCTIVE_TOOLS = {"Edit", "Write", "NotebookEdit", "MultiEdit"}
 
 
 def bucket_of(ctx):
@@ -121,6 +140,12 @@ def analyze(days=None):
     error_hits = collections.Counter()
     error_sessions = collections.defaultdict(set)
 
+    # Loop detection. For each agent we keep a rolling trace of what it did, so we can spot
+    # an agent repeating itself and an agent that stopped changing anything.
+    trace = collections.defaultdict(list)     # agent -> [(signature, productive)]
+    loops = []                                # (agent, signature, repeat count)
+    stall_runs = collections.Counter()        # agent -> longest run of unproductive calls
+
     first_seen_ts = last_seen_ts = None
 
     for rec in iter_records(days):
@@ -179,6 +204,22 @@ def analyze(days=None):
                 tool_names[block.get("id")] = name
                 tool_inputs[block.get("id")] = block.get("input") or {}
                 tool_calls[name] += 1
+
+                # Signature of what this call actually does, so an identical repeat is visible.
+                params = block.get("input") or {}
+                if name == "Bash":
+                    sig = f"Bash:{(params.get('command') or '')[:160]}"
+                elif name in ("Read", "Edit", "Write"):
+                    sig = f"{name}:{params.get('file_path','?')}"
+                elif name in ("Grep", "Glob"):
+                    sig = f"{name}:{params.get('pattern','?')}:{params.get('path','')}"
+                else:
+                    sig = f"{name}:{json.dumps(params, sort_keys=True, default=str)[:160]}"
+                # Editing the same file repeatedly is normal iterative work, not a loop, so
+                # productive tools carry no signature and are only used to break a stall run.
+                trace[agent_key].append((None if name in PRODUCTIVE_TOOLS else sig,
+                                         name in PRODUCTIVE_TOOLS))
+
                 if name == "Read":
                     params = block.get("input") or {}
                     path = params.get("file_path", "?")
@@ -215,6 +256,28 @@ def analyze(days=None):
     reread = sum(sum(c - 1 for c in files.values() if c > 1) for files in reads_per_agent.values())
     total_reads = sum(sum(files.values()) for files in reads_per_agent.values())
 
+    # Resolve the traces into loops and stalls.
+    LOOP_MIN = 3      # an identical call this many times over is a loop, not a retry
+    STALL_MIN = 25    # this many calls in a row without changing a file is spinning
+    for agent, steps in trace.items():
+        counts = collections.Counter(sig for sig, _ in steps if sig is not None)
+        for sig, n in counts.items():
+            if n >= LOOP_MIN:
+                loops.append((agent, sig, n))
+        run = best = 0
+        for _, productive in steps:
+            run = 0 if productive else run + 1
+            best = max(best, run)
+        if best >= STALL_MIN:
+            stall_runs[agent] = best
+
+    # Group loop signatures so the same mistake made by many agents reads as one finding.
+    loop_by_sig = collections.Counter()
+    loop_agents_by_sig = collections.defaultdict(set)
+    for agent, sig, n in loops:
+        loop_by_sig[sig] += n
+        loop_agents_by_sig[sig].add(agent)
+
     return {
         "window": {"from": (first_seen_ts or "")[:10], "to": (last_seen_ts or "")[:10]},
         "totals": dict(totals),
@@ -237,6 +300,17 @@ def analyze(days=None):
         "cmd_sessions": {k: len(v) for k, v in cmd_sessions.items()},
         "error_hits": dict(error_hits),
         "error_sessions": {k: len(v) for k, v in error_sessions.items()},
+        "loops": {
+            "signatures": loop_by_sig.most_common(200),
+            "agents_by_sig": {k: len(v) for k, v in loop_agents_by_sig.items()},
+            "agents_looping": len({a for a, _, _ in loops}),
+            "total_repeats": sum(n - 1 for _, _, n in loops),
+        },
+        "stalls": {
+            "agents": len(stall_runs),
+            "worst": max(stall_runs.values()) if stall_runs else 0,
+        },
+        "agent_count": len(trace),
     }
 
 
@@ -336,6 +410,26 @@ def report(data):
         for label, n in sorted(data["error_hits"].items(), key=lambda kv: -kv[1])[:10]:
             print(f"    {n:>5} hits across {data['error_sessions'].get(label,0):>3} sessions   {label}")
 
+    # Loops and stalls.
+    loops = data["loops"]
+    stalls = data["stalls"]
+    if loops["signatures"] or stalls["agents"]:
+        print("\n" + "-" * 74)
+        print("  LOOPS AND STALLS — agents repeating themselves or making no progress")
+        print("-" * 74)
+        if loops["signatures"]:
+            print(f"  {loops['agents_looping']} of {data['agent_count']} agents repeated an identical "
+                  f"call 3+ times ({loops['total_repeats']:,} redundant calls total).")
+            print("\n  Most-repeated calls:")
+            for sig, n in loops["signatures"][:8]:
+                n_agents = loops["agents_by_sig"].get(sig, 1)
+                shown = sig if len(sig) <= 58 else sig[:55] + "..."
+                print(f"    {n:>5}x by {n_agents:>3} agents   {shown}")
+        if stalls["agents"]:
+            print(f"\n  {stalls['agents']} agents went 25+ consecutive tool calls without editing "
+                  f"a file.")
+            print(f"  Longest such stretch: {stalls['worst']} calls with nothing changed.")
+
     # Recommendations, thresholded off the numbers above.
     print("\n" + "=" * 74)
     print("  WHAT TO DO")
@@ -358,16 +452,36 @@ def report(data):
     if r["whole_file"] and 100 * r["whole_file"] / max(r["whole_file"] + r["ranged"], 1) > 50:
         recs.append("Most reads pull whole files. Adding a table of contents with line ranges to "
                     "your largest files lets an agent ask for the part it needs.")
-    if data["error_hits"].get("zsh unmatched glob", 0) > 20:
-        recs.append(f"{data['error_hits']['zsh unmatched glob']} commands died on zsh's unmatched-glob "
-                    f"error (`grep --include=*.ts` and friends). Fix it at the shell, not in a docs "
-                    f"file: add `unsetopt nomatch` to ~/.zshrc.")
-    if data["error_hits"].get("docker/testcontainers", 0) > 50:
-        recs.append("Testcontainer failures are frequent. Document a fast test lane that does not "
-                    "boot containers; agents default to the slowest command you gave them.")
-    if data["error_hits"].get("permission denied", 0) > 30:
-        recs.append("Permission friction is costing real tokens. Add an `allow` list for read-only "
-                    "and routine dev commands to .claude/settings.json.")
+    if loops["total_repeats"] > 50:
+        top = loops["signatures"][0] if loops["signatures"] else ("", 0)
+        recs.append(f"{loops['total_repeats']:,} redundant calls came from agents repeating an "
+                    f"identical action 3+ times, across {loops['agents_looping']} agents. The most "
+                    f"repeated was `{top[0][:60]}`. A repeat loop means the agent could not tell "
+                    f"whether the call worked, so make the command's success or failure obvious, or "
+                    f"remove the need for it.")
+    if stalls["agents"] > 5:
+        recs.append(f"{stalls['agents']} agents ran 25+ consecutive tool calls without editing "
+                    f"anything (worst: {stalls['worst']}). Long unproductive stretches usually mean "
+                    f"the agent lost the thread and kept searching. These are the sessions worth "
+                    f"reading by hand.")
+    if data["error_hits"].get("shell glob not expanded", 0) > 20:
+        recs.append(f"{data['error_hits']['shell glob not expanded']} commands died because the "
+                    f"shell tried to expand a glob meant for the program (`--include=*.ts` and "
+                    f"friends). zsh treats an unmatched glob as a fatal error where bash passes it "
+                    f"through. Fix it in the shell rather than in a docs file: `unsetopt nomatch` "
+                    f"in ~/.zshrc (or `setopt +o nomatch`).")
+    if data["error_hits"].get("container / docker", 0) > 50:
+        recs.append("Container startup failures are frequent. If your default test command boots "
+                    "containers, document a fast lane that does not; agents use the slowest command "
+                    "you gave them because it is the only one they know about.")
+    if data["error_hits"].get("permission / approval", 0) > 30:
+        recs.append("Permission friction is costing real tokens. Add an allowlist for read-only and "
+                    "routine dev commands to your agent settings, and keep mutating commands out "
+                    "of it. Beware prefix matches: allowing `find` also allows `find -delete`.")
+    if data["error_hits"].get("port already in use", 0) > 10:
+        recs.append("Port conflicts recur. Agents leave dev servers running. Have them start "
+                    "long-running processes in the background with a known port and kill them by "
+                    "name, or pick a random free port.")
     cheap_models = sum(v for k, v in data["by_model"].items() if "haiku" in k or "sonnet" in k)
     if grand and cheap_models / grand < 0.2:
         recs.append(f"Only {100*cheap_models/grand:.0f}% of your tokens run on Sonnet or Haiku. "
