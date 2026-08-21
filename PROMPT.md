@@ -6,7 +6,9 @@ Run sediment first, then paste the prompt below into Claude Code in the repo you
 work in. It works best when the agent can read both the findings and the codebase they describe.
 
 ```bash
-python3 sediment.py --json findings.json
+tmp=$(mktemp -d)
+git clone https://github.com/vraspar/sediment "$tmp/sediment"
+python3 "$tmp/sediment/sediment.py" --json findings.json
 ```
 
 ---
@@ -16,6 +18,10 @@ python3 sediment.py --json findings.json
 > I ran a token audit on my Claude Code history. The findings are in `findings.json`, and the
 > summary is below. I want you to turn this into specific changes to this repo. Do not give me
 > general best practices — I want fixes tied to the evidence.
+>
+> The audit covers every project on my machine, so some findings name files, repos and branches
+> that do not exist here. Treat those as context about how I work, not as things to fix. Say
+> explicitly which findings belong to another repo, and do not propose changes for them.
 >
 > Paste the sediment output here.
 >

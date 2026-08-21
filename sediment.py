@@ -172,7 +172,8 @@ def analyze(days=None):
     by_model = collections.Counter()
 
     agents = collections.defaultdict(
-        lambda: {"tokens": 0, "turns": 0, "peak": 0, "out": 0, "model": "", "final_chars": 0})
+        lambda: {"tokens": 0, "turns": 0, "peak": 0, "out": 0, "model": "", "final_chars": 0,
+                 "session": "", "project": "", "started": ""})
     spawn_costs = []
 
     tool_bytes = collections.Counter()
@@ -241,6 +242,10 @@ def analyze(days=None):
                 rec_agent["out"] += out
                 rec_agent["peak"] = max(rec_agent["peak"], ctx)
                 rec_agent["model"] = msg.get("model", "")
+                if not rec_agent["session"]:
+                    rec_agent["session"] = sid
+                    rec_agent["project"] = os.path.basename(rec.get("cwd") or "") or "?"
+                    rec_agent["started"] = ts[:16].replace("T", " ")
                 body = msg.get("content")
                 if isinstance(body, list):
                     chars = sum(len(b.get("text", "") or "")
@@ -522,9 +527,11 @@ def report(data):
         print("\n" + "-" * 74)
         print(f"  SUBAGENTS — {len(agents)} total, top 10 are {100*top_share:.0f}% of subagent spend")
         print("-" * 74)
-        print(f"  {'tokens':>16}{'turns':>8}{'peak ctx':>12}{'output':>11}   model")
+        print(f"  {'tokens':>16}{'turns':>7}{'peak ctx':>11}   {'started':<16} {'project':<16} session")
         for a in top[:6]:
-            print(f"  {fmt(a['tokens']):>16}{a['turns']:>8,}{fmt(a['peak']):>12}{fmt(a['out']):>11}   {a['model']}")
+            print(f"  {fmt(a['tokens']):>16}{a['turns']:>7,}{fmt(a['peak']):>11}   "
+                  f"{a['started']:<16} {a['project'][:16]:<16} {a['session'][:8]}")
+        print("\n  Find one with: grep -rl <session> ~/.claude/projects")
         over = sum(1 for a in agents.values() if a["peak"] > 200_000)
         print(f"\n  {over} of {len(agents)} agents ({100*over/len(agents):.0f}%) grew past 200k context.")
         if data["spawn_costs"]:
@@ -551,7 +558,7 @@ def report(data):
         print("\n" + "-" * 74)
         print("  SPLIT CANDIDATES — files whose shape forces a wide read for a narrow question")
         print("-" * 74)
-        print(f"  {'wasted':>9}{'avg size':>10}{'reads':>7}{'agents':>8}{'copies':>8}   file")
+        print(f"  {'wasted':>9}{'avg size':>10}{'reads':>7}{'agents':>8}{'checkouts':>10}   file")
         for c in cands[:10]:
             path = c["path"]
             if len(path) > 40:
