@@ -83,6 +83,28 @@ def is_throwaway(path):
             or lowered.endswith(THROWAWAY_EXTS))
 
 
+def redact(text):
+    """Strip identifying detail from a string so a report can be shared.
+
+    The report quotes real command lines and real absolute paths, which is what makes it useful
+    locally and risky in a public issue. This keeps the shape and drops the specifics.
+    """
+    text = text.replace(os.path.expanduser("~"), "~")
+    text = re.sub(r"/Users/[^/\s]+", "/Users/USER", text)
+    text = re.sub(r"/home/[^/\s]+", "/home/USER", text)
+    # Collapse any remaining long path to its last two components.
+    text = re.sub(r"(?:/[\w.\-]+){3,}", lambda m: ".../" + "/".join(m.group(0).split("/")[-2:]), text)
+    return text
+
+
+def redact_signature(sig):
+    """Reduce a tool-call signature to its shape: the tool, and the command verb if it is Bash."""
+    if sig.startswith("Bash:"):
+        return "Bash:" + normalize_command(sig[5:])
+    tool, _, rest = sig.partition(":")
+    return f"{tool}:{redact(rest)}" if rest else tool
+
+
 def group_key(path):
     """Collapse the same file checked out in several worktrees into one entry.
 
@@ -419,7 +441,7 @@ def fmt(n):
     return f"{int(n):,}"
 
 
-def report(data, show_all=False):
+def report(data, show_all=False, anonymous=False):
     t = data["totals"]
     grand = sum(t.values())
     side = sum(data["sidechain_totals"].values())
@@ -517,7 +539,7 @@ def report(data, show_all=False):
         print("-" * 74)
         print(f"  {'wasted':>9}{'avg size':>10}{'reads':>7}{'agents':>8}{'copies':>8}   file")
         for c in cands[:10]:
-            path = c["path"]
+            path = redact(c["path"]) if anonymous else c["path"]
             if len(path) > 40:
                 path = "..." + path[-37:]
             print(f"  {fmt(c['wasted_tokens']):>9}{fmt(c['avg_tokens']):>10}"
@@ -549,6 +571,7 @@ def report(data, show_all=False):
             print("\n  Most-repeated calls:")
             for sig, n in loops["signatures"][:8]:
                 n_agents = loops["agents_by_sig"].get(sig, 1)
+                sig = redact_signature(sig) if anonymous else sig
                 shown = sig if len(sig) <= 58 else sig[:55] + "..."
                 print(f"    {n:>5}x by {n_agents:>3} agents   {shown}")
         if stalls["agents"]:
@@ -574,7 +597,8 @@ def report(data, show_all=False):
     if cands:
         top = cands[0]
         recs.append(f"Split the files under SPLIT CANDIDATES. The worst is "
-                    f"`{top['path']}` — {top['agents']} different agents read it "
+                    f"`{redact(top['path']) if anonymous else top['path']}` — "
+                    f"{top['agents']} different agents read it "
                     f"{top['views']} times at ~{fmt(top['avg_tokens'])} tokens a read, burning "
                     f"~{fmt(top['wasted_tokens'])} tokens on repeat reads alone. A file this shape "
                     f"is answering narrow questions with a wide read; splitting it by "
@@ -641,6 +665,9 @@ def report(data, show_all=False):
                     f"Read-only exploration rarely needs your largest model.")
     if not recs:
         recs.append("Nothing above the alarm thresholds. Your setup looks healthy.")
+    if not anonymous:
+        print("\n  This report quotes real command lines and absolute paths from your machine.")
+        print("  Re-run with --redact before pasting it anywhere public.")
     shown = recs if show_all else recs[:6]
     for i, rec in enumerate(shown, 1):
         print(f"\n  {i}. {rec}")
@@ -655,13 +682,29 @@ def main():
     ap.add_argument("--days", type=int, help="only look at the last N days")
     ap.add_argument("--json", metavar="PATH", help="also write raw findings as JSON")
     ap.add_argument("--all", action="store_true", help="show every recommendation, not just the top 6")
+    ap.add_argument("--redact", action="store_true",
+                    help="strip usernames, absolute paths and command arguments, for sharing")
     args = ap.parse_args()
 
     data = analyze(args.days)
-    report(data, show_all=args.all)
+    report(data, show_all=args.all, anonymous=args.redact)
 
     if args.json:
         serializable = dict(data)
+        if args.redact:
+            # The JSON is the copy most likely to be pasted somewhere or handed to a service,
+            # so redact it on the same flag rather than leaving a raw file behind.
+            serializable["loops"] = dict(serializable["loops"])
+            serializable["loops"]["signatures"] = [
+                [redact_signature(sig), n] for sig, n in serializable["loops"]["signatures"]]
+            serializable["loops"]["agents_by_sig"] = {
+                redact_signature(k): v for k, v in serializable["loops"]["agents_by_sig"].items()}
+            serializable["split_candidates"] = [
+                {**c, "path": redact(c["path"])} for c in serializable["split_candidates"]]
+            serializable["cmd_failures"] = {
+                redact(k): v for k, v in serializable["cmd_failures"].items()}
+            serializable["cmd_sessions"] = {
+                redact(k): v for k, v in serializable["cmd_sessions"].items()}
         serializable["agents"] = [
             {k: v for k, v in a.items()}
             for a in sorted(data["agents"].values(), key=lambda x: -x["tokens"])[:50]
