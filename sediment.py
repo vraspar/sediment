@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-claude-code-autopsy — find out where your Claude Code tokens actually go.
+sediment — find out where your Claude Code tokens actually go.
 
 Reads the transcripts Claude Code already writes to ~/.claude/projects and reports
 what you are paying for. Everything is local; nothing is uploaded anywhere.
 
-    python3 autopsy.py                  # analyze everything
-    python3 autopsy.py --days 30        # only the last 30 days
-    python3 autopsy.py --json out.json  # machine-readable, for feeding to an agent
+    python3 sediment.py                  # analyze everything
+    python3 sediment.py --days 30        # only the last 30 days
+    python3 sediment.py --json out.json  # machine-readable, for feeding to an agent
 
 The headline number is the burn ratio: tokens spent per token of useful output,
 bucketed by how full the context window was at the time. It rises steeply, which is
@@ -327,7 +327,7 @@ def report(data):
     w = data["window"]
 
     print("=" * 74)
-    print(f"  CLAUDE CODE AUTOPSY    {w['from']} to {w['to']}")
+    print(f"  SEDIMENT    {w['from']} to {w['to']}")
     print("=" * 74)
 
     print(f"\nTotal tokens processed: {fmt(grand)}")

@@ -2,11 +2,11 @@
 
 The script tells you what happened. This prompt turns that into changes to your repo.
 
-Run the autopsy first, then paste the prompt below into Claude Code in the repo you actually
+Run sediment first, then paste the prompt below into Claude Code in the repo you actually
 work in. It works best when the agent can read both the findings and the codebase they describe.
 
 ```bash
-python3 autopsy.py --json findings.json
+python3 sediment.py --json findings.json
 ```
 
 ---
@@ -17,7 +17,7 @@ python3 autopsy.py --json findings.json
 > summary is below. I want you to turn this into specific changes to this repo. Do not give me
 > general best practices — I want fixes tied to the evidence.
 >
-> Paste the autopsy output here.
+> Paste the sediment output here.
 >
 > Work through this in order:
 >
@@ -76,7 +76,7 @@ steps 1 and 2 and should be sent back.
 
 ## Re-run afterwards
 
-The point of a measurement tool is the second measurement. Re-run the autopsy a couple of weeks
+The point of a measurement tool is the second measurement. Re-run sediment a couple of weeks
 after making changes and compare. Watch the share of spend above 200k context, the recurring
 error counts, and the re-read rate.
 
