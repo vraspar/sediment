@@ -35,40 +35,54 @@ BUCKETS = [
     (600_000, 10**9, ">600k"),
 ]
 
-# Error signatures worth attributing downstream burn to. Ordered most to least specific
-# so the first match wins. Deliberately spans several ecosystems: the point is to work on
-# somebody else's stack, not only the one this was written against.
+# Error signatures, matched only against results the harness marked as failures. Ordered most
+# to least specific so the first match wins, and deliberately spanning several ecosystems.
+#
+# Every pattern here matches text that appears only when something failed, never a word that
+# also appears in ordinary output about the same subject: "testcontainer" shows up in passing
+# test names, "eslint" in directory listings. Matching those inflated the table roughly twenty
+# fold before this was tightened.
+#
+# The table undercounts, deliberately. A command that fails inside a pipeline, or reports
+# failures in its output while still exiting zero, is not marked as an error by the harness and
+# is not counted here. Overcounting was the worse failure: it made the report confidently wrong.
 ERROR_PATTERNS = [
     # Shell and environment
-    ("shell glob not expanded", r"no matches found:|nomatch|bad pattern:"),
+    ("shell glob not expanded", r"no matches found:|zsh: bad pattern:"),
     ("command not found", r"command not found|is not recognized as an internal"),
     ("permission / approval", r"[Pp]ermission denied|requires approval|EACCES|not permitted"),
     ("file not found", r"No such file or directory|ENOENT"),
     ("command timed out", r"command timed out|timed out after|ETIMEDOUT"),
-    ("port already in use", r"EADDRINUSE|address already in use|port .* already"),
+    ("port already in use", r"EADDRINUSE|address already in use|port \d+ is already"),
     # Test runners, several ecosystems
-    ("test failure (js)", r"FAIL\s+\S+|Tests?:\s+\d+\s+failed|✕ |● .*›"),
-    ("test failure (python)", r"=+ FAILURES =+|\d+ failed,|E\s+assert |pytest"),
+    ("test failure (js)", r"^\s*FAIL\s+\S+|Tests?:?\s+\d+\s+failed|✕ |● .*›"),
+    ("test failure (python)", r"=+ FAILURES =+|\d+ failed[,\s]|E\s+assert "),
     ("test failure (go)", r"^--- FAIL|FAIL\s+\S+\s+\d+\.\d+s"),
     ("test failure (rust/other)", r"test result: FAILED|thread '.*' panicked"),
     # Build and type systems
-    ("type error", r"error TS\d{4}|mypy: |error\[E\d+\]|type error:"),
-    ("lint failure", r"\d+ problems? \(\d+ error|eslint|ruff|rubocop.*offense"),
+    ("type error", r"error TS\d{4}|mypy: error:|error\[E\d+\]|type error:"),
+    ("lint failure", r"\d+ problems? \(\d+ error|✖ \d+ problem|rubocop.*\d+ offense"),
     ("package script failure", r"ELIFECYCLE|command failed with exit code|npm ERR!|make: \*\*\*"),
     ("dependency resolution", r"ERESOLVE|could not resolve dependency|version solving failed"),
     # Infra
-    ("container / docker", r"testcontainer|docker.*(daemon|not running)|Cannot connect to the Docker"),
+    ("container / docker", r"Could not find a working container runtime|"
+                           r"docker.*(daemon is not running|Cannot connect)|"
+                           r"Cannot connect to the Docker"),
     ("database connection", r"ECONNREFUSED.*(5432|3306|27017)|could not connect to server|connection refused"),
     # Version control
     ("git conflict or dirty tree", r"CONFLICT|would be overwritten|Your local changes"),
-    ("git worktree/branch exists", r"already exists|is already checked out"),
+    ("git worktree/branch exists", r"fatal:.*already exists|is already checked out"),
     # Agent-harness specific
-    ("edit target missing", r"String to replace not found|has not been read yet|old_string"),
+    ("edit target missing", r"String to replace not found|has not been read yet"),
 ]
 
 # Commands that exit non-zero to mean "no match" rather than "something broke". The harness
 # marks those results as errors, which buries real failures under searches that found nothing.
 EXIT_1_IS_NORMAL = {"grep", "rg", "egrep", "fgrep", "find", "diff", "test", "cmp", "ag", "ack"}
+
+# Shapes that say nothing about your setup: shell keywords that are not commands, and calls the
+# harness refuses on purpose. Counting them puts noise at the top of the failing-command list.
+NOT_YOUR_PROBLEM = {"sleep", "for", "while", "if", "do", "done", "then", "fi", "(empty)"}
 
 
 # Tool calls that change something. Used to tell real progress from spinning.
@@ -198,6 +212,8 @@ def analyze(days=None):
     pending = collections.defaultdict(list)      # agent -> [(label, turns_left, spend_at_start)]
     downstream = collections.Counter()           # label -> tokens spent after it appeared
     billed = collections.defaultdict(set)        # label -> {(agent, turn index) already charged}
+    billed_any = set()                           # every (agent, turn) charged by any label
+    downstream_total = [0]                       # corpus-wide, each turn counted once
     agent_turn = collections.Counter()           # agent -> turns seen so far
     examples = {}                                # label -> one real sample, for the report
     agent_spend = collections.Counter()          # agent -> running total
@@ -260,6 +276,9 @@ def analyze(days=None):
                 if key not in billed[sig_label]:
                     billed[sig_label].add(key)
                     downstream[sig_label] += spent
+                if key not in billed_any:
+                    billed_any.add(key)
+                    downstream_total[0] += spent
                 if left > 1:
                     still.append((sig_label, left - 1, at_start))
             pending[agent_key] = still
@@ -347,9 +366,11 @@ def analyze(days=None):
                 is_error = block.get("is_error") or False
                 shape = None
                 if is_error and name == "Bash":
-                    shape = normalize_command((tool_inputs.get(tid) or {}).get("command", ""))
+                    shape = normalize_command((tool_inputs.get(tid) or {}).get("command") or "")
                     body = re.sub(r"^\s*Exit code \d+\s*", "", text).strip()
-                    if shape.split()[0] in EXIT_1_IS_NORMAL and not body:
+                    if shape.split()[0] in NOT_YOUR_PROBLEM:
+                        shape = None
+                    elif shape.split()[0] in EXIT_1_IS_NORMAL and not body:
                         # A search that printed nothing and exited non-zero found nothing.
                         is_error = False
                         shape = None
@@ -359,7 +380,7 @@ def analyze(days=None):
                 if text and is_error:
                     head = text[:4000]
                     for label, pattern in ERROR_PATTERNS:
-                        found = re.search(pattern, head)
+                        found = re.search(pattern, head, re.MULTILINE)
                         if found:
                             error_hits[label] += 1
                             error_sessions[label].add(sid)
@@ -494,6 +515,7 @@ def analyze(days=None):
         "cmd_failures": dict(cmd_failures),
         "cmd_sessions": {k: len(v) for k, v in cmd_sessions.items()},
         "downstream": dict(downstream),
+        "downstream_total": downstream_total[0],
         "examples": dict(examples),
         "error_hits": dict(error_hits),
         "error_sessions": {k: len(v) for k, v in error_sessions.items()},
@@ -609,6 +631,9 @@ def report(data):
               f"{r['whole_file']+r['ranged']:,} ({100*r['whole_file']/max(r['whole_file']+r['ranged'],1):.0f}%)")
 
     cands = data.get("split_candidates") or []
+    # A handful of tokens is not worth a section; it reads as a finding when it is not one.
+    if sum(c["wasted_tokens"] for c in cands) < 100_000:
+        cands = []
     if cands:
         print("\n" + "-" * 74)
         print("  SPLIT CANDIDATES — files whose shape forces a wide read for a narrow question")
@@ -621,7 +646,8 @@ def report(data):
             print(f"  {fmt(c['wasted_tokens']):>9}{fmt(c['avg_tokens']):>10}"
                   f"{c['views']:>7}{c['agents']:>8}{c['checkouts']:>10}   {path}")
         total_wasted = sum(c["wasted_tokens"] for c in cands)
-        print(f"\n  {len(cands)} files fit the pattern; re-reading them cost ~{fmt(total_wasted)} tokens.")
+        noun = "file" if len(cands) == 1 else "files"
+        print(f"\n  {len(cands)} {noun} fit the pattern; re-reading them cost ~{fmt(total_wasted)} tokens.")
         print("  'wasted' is tokens spent on reads after the first, which is what a split recovers.")
 
     if data["cmd_failures"]:
@@ -640,7 +666,7 @@ def report(data):
                   f"sessions   {label}")
             if eg.get(label):
                 print(f"                     e.g. {eg[label]}")
-        total_down = sum(down.get(k, 0) for k in data["error_hits"])
+        total_down = data.get("downstream_total", 0)
         if grand:
             print(f"\n  All error signatures together: {fmt(total_down)} tokens, "
                   f"{100*total_down/grand:.1f}% of everything. Attribution, not proof.")
@@ -668,91 +694,100 @@ def report(data):
 
     # Recommendations, thresholded off the numbers above.
     print("\n" + "=" * 74)
-    print("  WHAT TO DO")
+    print("  WHAT LOOKS WORTH FIXING, LARGEST FIRST")
     print("=" * 74)
+    # Each recommendation carries the tokens it plausibly concerns, so the list reads in order of
+    # size rather than in the order the checks happen to run. The weights are rough: they say
+    # which findings look worth reading first, not what any fix would return.
+    down = data.get("downstream") or {}
+    over600 = sum(v for k, v in data["by_bucket"].items() if k == ">600k")
+    splitw = sum(c["wasted_tokens"] for c in (data.get("split_candidates") or []))
+    loopw = 0
     recs = []
     if high and 100 * high / grand > 30:
-        recs.append(
-            f"Cap agent context. {100*high/grand:.0f}% of your spend happens above 200k context, "
-            f"where each token of output costs several times what it does early in a session. "
-            f"Have long-running agents checkpoint their state to a file, branch, or PR at ~200k "
-            f"and hand off to a fresh one. This is almost always the single biggest lever.")
+        recs.append((high, 
+            f"{100*high/grand:.0f}% of spend happened above 200k context, where a token of output "
+            f"cost several times what it did earlier in a session. Long-running agents that "
+            f"checkpoint to a file, branch or PR and hand off to a fresh one would avoid some of "
+            f"that. On most corpora this is the largest single line item."))
     if agents and sum(1 for a in agents.values() if a["peak"] > 600_000):
         n = sum(1 for a in agents.values() if a["peak"] > 600_000)
-        recs.append(f"{n} agent(s) exceeded 600k context. Check what they were doing; agents that "
-                    f"run for hundreds of turns usually needed to be several agents.")
+        recs.append((over600, f"{n} agents went past 600k context. Worth checking what they were "
+                    f"doing; runs that long are often several tasks in one agent."))
     if cands:
         top = cands[0]
-        recs.append(f"Split the files under SPLIT CANDIDATES. The worst is "
+        recs.append((splitw, f"Split the files under SPLIT CANDIDATES. The worst is "
                     f"`{top['path']}` — {top['agents']} different agents read it "
                     f"{top['views']} times at ~{fmt(top['avg_tokens'])} tokens a read, burning "
                     f"~{fmt(top['wasted_tokens'])} tokens on repeat reads alone. A file this shape "
                     f"is answering narrow questions with a wide read; splitting it by "
                     f"responsibility, or adding a table of contents with line ranges, lets an agent "
-                    f"ask for the part it needs.")
+                    f"ask for the part it needs."))
     elif r["total"] and 100 * r["reread"] / r["total"] > 25:
-        recs.append(f"{100*r['reread']/r['total']:.0f}% of reads re-open a file the agent already "
+        recs.append((0, f"{100*r['reread']/r['total']:.0f}% of reads re-open a file the agent already "
                     f"read, but no single file dominates. That points at reading habits rather than "
-                    f"file structure.")
+                    f"file structure."))
     if r["whole_file"] and 100 * r["whole_file"] / max(r["whole_file"] + r["ranged"], 1) > 50:
-        recs.append("Most reads pull whole files. Adding a table of contents with line ranges to "
-                    "your largest files lets an agent ask for the part it needs.")
+        recs.append((0, "Most reads pull whole files. A table of contents with line ranges in the "
+                    "largest files would let an agent ask for the part it needs."))
     dead = data.get("dead_ends") or {}
     if dead.get("count") and side:
         share = 100 * dead["tokens"] / max(side, 1)
-        recs.append(f"{dead['count']} agents ran 25+ turns and signed off with under 800 "
+        recs.append((dead['tokens'], f"{dead['count']} agents ran 25+ turns and signed off with under 800 "
                     f"characters, costing {fmt(dead['tokens'])} tokens ({share:.0f}% of subagent "
-                    f"spend). Work that thin either got abandoned or was redone somewhere else. "
-                    f"Read a few of them; the usual cause is a task that was never scoped tightly "
-                    f"enough to finish.")
+                    f"spend). Some of that is likely work abandoned or redone elsewhere, though a short "
+                    f"sign-off does not prove it. Worth opening a few. "
+                    f""))
     mcp = data.get("mcp") or {}
     if mcp.get("by_server"):
         mcp_total = sum(mcp["by_server"].values())
         share = 100 * mcp_total / max(mcp["total_tool_calls"], 1)
         if share < 2:
             servers = ", ".join(sorted(mcp["by_server"], key=lambda s: -mcp["by_server"][s])[:4])
-            recs.append(f"MCP tools were {share:.1f}% of your tool calls ({fmt(mcp_total)} of "
-                        f"{fmt(mcp['total_tool_calls'])}), across: {servers}. Every connected "
-                        f"server's tool schemas sit in your context on every turn whether you call "
-                        f"them or not. Disconnect the ones you are not using per project.")
+            recs.append((0, f"MCP tools were {share:.1f}% of your tool calls ({fmt(mcp_total)} of "
+                        f"{fmt(mcp['total_tool_calls'])}), across: {servers}. Each connected "
+                        f"server's tool schemas sit in context on every turn whether or not you "
+                        f"call them, so pruning unused ones per project may help."))
+    loopw = loops["total_repeats"] * (grand // max(sum(data["turns_by_bucket"].values()), 1))
     if loops["total_repeats"] > 50:
         top = loops["signatures"][0] if loops["signatures"] else ("", 0)
-        recs.append(f"{loops['total_repeats']:,} redundant calls came from agents repeating an "
+        recs.append((loopw, f"{loops['total_repeats']:,} redundant calls came from agents repeating an "
                     f"identical action 3+ times, across {loops['agents_looping']} agents. The most "
-                    f"repeated was `{top[0][:60]}`. A repeat loop means the agent could not tell "
-                    f"whether the call worked, so make the command's success or failure obvious, or "
-                    f"remove the need for it.")
+                    f"repeated was `{top[0][:60]}`. Repeats often mean the agent could not tell "
+                    f"whether the call worked; making success or failure obvious, or removing the "
+                    f"need for the call, tends to help."))
     if stalls["agents"] > 5:
-        recs.append(f"{stalls['agents']} agents ran 25+ consecutive tool calls without editing "
-                    f"anything (worst: {stalls['worst']}). Long unproductive stretches usually mean "
-                    f"the agent lost the thread and kept searching. These are the sessions worth "
-                    f"reading by hand.")
+        recs.append((0, f"{stalls['agents']} agents ran 25+ consecutive tool calls without editing "
+                    f"anything (worst: {stalls['worst']}). That can mean an agent lost the thread, "
+                    f"though read-only work looks the same. Worth a look."))
     if data["error_hits"].get("shell glob not expanded", 0) > 20:
-        recs.append(f"{data['error_hits']['shell glob not expanded']} commands died because the "
+        recs.append((down.get('shell glob not expanded', 0), f"{data['error_hits']['shell glob not expanded']} commands died because the "
                     f"shell tried to expand a glob meant for the program (`--include=*.ts` and "
                     f"friends). zsh treats an unmatched glob as a fatal error where bash passes it "
-                    f"through. Fix it in the shell rather than in a docs file: `unsetopt nomatch` "
-                    f"in ~/.zshrc (or `setopt +o nomatch`).")
+                    f"through. This is fixable in the shell rather than in a docs file: `unsetopt nomatch` "
+                    f"in ~/.zshrc (or `setopt +o nomatch`)."))
     if data["error_hits"].get("container / docker", 0) > 50:
-        recs.append("Container startup failures are frequent. If your default test command boots "
+        recs.append((down.get('container / docker', 0), "Container startup failures are frequent. If your default test command boots "
                     "containers, document a fast lane that does not; agents use the slowest command "
-                    "you gave them because it is the only one they know about.")
+                    "you gave them because it is the only one they know about."))
     if data["error_hits"].get("permission / approval", 0) > 30:
-        recs.append("Permission friction is costing real tokens. Add an allowlist for read-only and "
+        recs.append((down.get('permission / approval', 0), "Permission friction is costing real tokens. Add an allowlist for read-only and "
                     "routine dev commands to your agent settings, and keep mutating commands out "
-                    "of it. Beware prefix matches: allowing `find` also allows `find -delete`.")
+                    "of it. Beware prefix matches: allowing `find` also allows `find -delete`."))
     if data["error_hits"].get("port already in use", 0) > 10:
-        recs.append("Port conflicts recur. Agents leave dev servers running. Have them start "
+        recs.append((down.get('port already in use', 0), "Port conflicts recur. Agents leave dev servers running. Have them start "
                     "long-running processes in the background with a known port and kill them by "
-                    "name, or pick a random free port.")
+                    "name, or pick a random free port."))
     cheap_models = sum(v for k, v in data["by_model"].items() if "haiku" in k or "sonnet" in k)
     if grand and cheap_models / grand < 0.2:
-        recs.append(f"Only {100*cheap_models/grand:.0f}% of your tokens run on Sonnet or Haiku. "
-                    f"Read-only exploration rarely needs your largest model.")
+        recs.append((0, f"Only {100*cheap_models/grand:.0f}% of your tokens run on Sonnet or Haiku. "
+                    f"Read-only exploration may not need your largest model."))
     if not recs:
-        recs.append("Nothing above the alarm thresholds. Your setup looks healthy.")
-    for i, rec in enumerate(recs, 1):
-        print(f"\n  {i}. {rec}")
+        recs.append((0, "Nothing crossed the thresholds this run."))
+    recs.sort(key=lambda pair: -pair[0])
+    for weight, rec in recs:
+        size = f"~{fmt(weight)} tokens" if weight else "size not measured"
+        print(f"\n  [{size}]  {rec}")
     print()
 
 
