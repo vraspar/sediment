@@ -422,51 +422,60 @@ def fmt(n):
 def report(data, show_all=False):
     t = data["totals"]
     grand = sum(t.values())
-    if not grand:
-        sys.exit("No token usage found. Nothing to report.")
     side = sum(data["sidechain_totals"].values())
+    # A transcript can hold real tool activity with no usage telemetry attached. The token
+    # sections are meaningless then, but the loops, errors and re-reads are not, so print what
+    # there is rather than throwing the whole report away.
+    have_tokens = grand > 0
     w = data["window"]
 
     print("=" * 74)
     print(f"  SEDIMENT    {w['from']} to {w['to']}")
     print("=" * 74)
 
-    print(f"\nTotal tokens processed: {fmt(grand)}")
-    print(f"  cache reads   {fmt(t.get('cache_read', 0)):>16}  {100*t.get('cache_read',0)/grand:5.1f}%")
-    print(f"  cache writes  {fmt(t.get('cache_write', 0)):>16}  {100*t.get('cache_write',0)/grand:5.1f}%")
-    print(f"  fresh input   {fmt(t.get('in', 0)):>16}  {100*t.get('in',0)/grand:5.1f}%")
-    print(f"  output        {fmt(t.get('out', 0)):>16}  {100*t.get('out',0)/grand:5.1f}%")
+    high = high_out = 0
+    if not have_tokens:
+        print("\nNo token usage recorded in these transcripts. Token sections are skipped;"
+              "\nthe behaviour findings below are unaffected.")
+    else:
+        print(f"\nTotal tokens processed: {fmt(grand)}")
+        print(f"  cache reads   {fmt(t.get('cache_read', 0)):>16}  {100*t.get('cache_read',0)/grand:5.1f}%")
+        print(f"  cache writes  {fmt(t.get('cache_write', 0)):>16}  {100*t.get('cache_write',0)/grand:5.1f}%")
+        print(f"  fresh input   {fmt(t.get('in', 0)):>16}  {100*t.get('in',0)/grand:5.1f}%")
+        print(f"  output        {fmt(t.get('out', 0)):>16}  {100*t.get('out',0)/grand:5.1f}%")
 
-    cr, cw = t.get("cache_read", 0), t.get("cache_write", 0)
-    if cr + cw:
-        print(f"\nCache hit rate: {100*cr/(cr+cw):.1f}%  (above ~85% means caching is not your problem)")
-    print(f"Subagents:      {100*side/grand:.0f}% of all tokens")
+        cr, cw = t.get("cache_read", 0), t.get("cache_write", 0)
+        if cr + cw:
+            print(f"\nCache hit rate: {100*cr/(cr+cw):.1f}%"
+                  f"  (above ~85% means caching is not your problem)")
+        print(f"Subagents:      {100*side/grand:.0f}% of all tokens")
 
-    # The headline.
-    print("\n" + "-" * 74)
-    print("  BURN RATIO — tokens spent per token of output, by context size")
-    print("-" * 74)
-    print(f"  {'context':<12}{'turns':>9}{'tokens spent':>17}{'output':>13}{'burn':>10}")
-    ratios = {}
-    for _, _, label in BUCKETS:
-        spent = data["by_bucket"].get(label, 0)
-        if not spent:
-            continue
-        out = data["out_by_bucket"].get(label, 0)
-        ratio = spent / max(out, 1)
-        ratios[label] = ratio
-        print(f"  {label:<12}{data['turns_by_bucket'].get(label,0):>9,}{fmt(spent):>17}{fmt(out):>13}{ratio:>9.0f}x")
+        # The headline.
+        print("\n" + "-" * 74)
+        print("  BURN RATIO — tokens spent per token of output, by context size")
+        print("-" * 74)
+        print(f"  {'context':<12}{'turns':>9}{'tokens spent':>17}{'output':>13}{'burn':>10}")
+        ratios = {}
+        for _, _, label in BUCKETS:
+            spent = data["by_bucket"].get(label, 0)
+            if not spent:
+                continue
+            out = data["out_by_bucket"].get(label, 0)
+            ratio = spent / max(out, 1)
+            ratios[label] = ratio
+            print(f"  {label:<12}{data['turns_by_bucket'].get(label,0):>9,}"
+                  f"{fmt(spent):>17}{fmt(out):>13}{ratio:>9.0f}x")
 
-    if len(ratios) > 1:
-        cheap = min(ratios.values())
-        dear = max(ratios.values())
-        print(f"\n  Same work costs {dear/cheap:.0f}x more at the top of this table than the bottom.")
-    high = sum(v for k, v in data["by_bucket"].items() if k in ("200-400k", "400-600k", ">600k"))
-    high_out = sum(v for k, v in data["out_by_bucket"].items() if k in ("200-400k", "400-600k", ">600k"))
-    total_out = sum(data["out_by_bucket"].values())
-    if high:
-        print(f"  Turns above 200k context: {100*high/grand:.0f}% of spend, "
-              f"{100*high_out/max(total_out,1):.0f}% of output.")
+        if len(ratios) > 1:
+            print(f"\n  Same work costs {max(ratios.values())/min(ratios.values()):.0f}x more "
+                  f"at the top of this table than the bottom.")
+        high = sum(v for k, v in data["by_bucket"].items() if k in ("200-400k", "400-600k", ">600k"))
+        high_out = sum(v for k, v in data["out_by_bucket"].items()
+                       if k in ("200-400k", "400-600k", ">600k"))
+        total_out = sum(data["out_by_bucket"].values())
+        if high:
+            print(f"  Turns above 200k context: {100*high/grand:.0f}% of spend, "
+                  f"{100*high_out/max(total_out,1):.0f}% of output.")
 
     # Agents.
     agents = data["agents"]
