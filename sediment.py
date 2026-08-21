@@ -69,6 +69,10 @@ ERROR_PATTERNS = [
 # Tool calls that change something. Used to tell real progress from spinning.
 PRODUCTIVE_TOOLS = {"Edit", "Write", "NotebookEdit", "MultiEdit"}
 
+# An agent whose last act is one of these handed its work off through the harness rather than
+# writing a final message, so a short final message does not mean it produced nothing.
+DELIVERY_TOOLS = {"StructuredOutput", "SendMessage", "TaskOutput", "ReportFindings"}
+
 # Files nobody can restructure: scratch output, generated dumps, vendored code. Reading these
 # repeatedly may still be wasteful, but "split this file" is not the fix, so they are excluded
 # from split candidates rather than offered as advice that cannot be taken.
@@ -81,28 +85,6 @@ def is_throwaway(path):
     lowered = path.lower()
     return (any(d in lowered for d in THROWAWAY_DIRS)
             or lowered.endswith(THROWAWAY_EXTS))
-
-
-def redact(text):
-    """Strip identifying detail from a string so a report can be shared.
-
-    The report quotes real command lines and real absolute paths, which is what makes it useful
-    locally and risky in a public issue. This keeps the shape and drops the specifics.
-    """
-    text = text.replace(os.path.expanduser("~"), "~")
-    text = re.sub(r"/Users/[^/\s]+", "/Users/USER", text)
-    text = re.sub(r"/home/[^/\s]+", "/home/USER", text)
-    # Collapse any remaining long path to its last two components.
-    text = re.sub(r"(?:/[\w.\-]+){3,}", lambda m: ".../" + "/".join(m.group(0).split("/")[-2:]), text)
-    return text
-
-
-def redact_signature(sig):
-    """Reduce a tool-call signature to its shape: the tool, and the command verb if it is Bash."""
-    if sig.startswith("Bash:"):
-        return "Bash:" + normalize_command(sig[5:])
-    tool, _, rest = sig.partition(":")
-    return f"{tool}:{redact(rest)}" if rest else tool
 
 
 def group_key(path):
@@ -126,6 +108,12 @@ def bucket_of(ctx):
 def normalize_command(cmd):
     """Collapse a shell command to its shape so retries of the same thing group together."""
     cmd = cmd.strip().split("\n")[0]
+    # Step over wrappers so the shape is the command that failed, not the navigation before it.
+    for _ in range(3):
+        stripped = re.sub(r"^\s*(cd|export|env|source)\s+[^&;|]*(&&|;)\s*", "", cmd)
+        if stripped == cmd:
+            break
+        cmd = stripped
     head = cmd.split()[:1]
     if not head:
         return "(empty)"
@@ -140,7 +128,7 @@ def normalize_command(cmd):
 def iter_records(days=None):
     """Yield every transcript record. Transcripts nest several levels deep, so recurse."""
     cutoff = None
-    if days:
+    if days is not None:
         cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)).isoformat()
     files = glob.glob(os.path.join(ROOT, "**", "*.jsonl"), recursive=True)
     if not files:
@@ -155,7 +143,10 @@ def iter_records(days=None):
                         rec = json.loads(line)
                     except (ValueError, TypeError):
                         continue
-                    if cutoff and (rec.get("timestamp") or "") < cutoff:
+                    if not isinstance(rec, dict):
+                        continue
+                    ts = rec.get("timestamp")
+                    if cutoff and (ts if isinstance(ts, str) else "") < cutoff:
                         continue
                     yield rec
         except OSError:
@@ -202,7 +193,8 @@ def analyze(days=None):
         sid = rec.get("sessionId", "?")
         agent_key = (sid, rec.get("agentId") or "-")
         is_side = bool(rec.get("isSidechain"))
-        ts = rec.get("timestamp") or ""
+        ts = rec.get("timestamp")
+        ts = ts if isinstance(ts, str) else ""
         if ts:
             if first_seen_ts is None or ts < first_seen_ts:
                 first_seen_ts = ts
@@ -211,10 +203,11 @@ def analyze(days=None):
 
         usage = msg.get("usage")
         if isinstance(usage, dict):
-            inp = usage.get("input_tokens") or 0
-            out = usage.get("output_tokens") or 0
-            cr = usage.get("cache_read_input_tokens") or 0
-            cw = usage.get("cache_creation_input_tokens") or 0
+            def _n(key):
+                value = usage.get(key) or 0
+                return value if isinstance(value, int) else 0
+            inp, out = _n("input_tokens"), _n("output_tokens")
+            cr, cw = _n("cache_read_input_tokens"), _n("cache_creation_input_tokens")
             ctx = inp + cr + cw
             spent = ctx + out
 
@@ -240,9 +233,13 @@ def analyze(days=None):
                 rec_agent["model"] = msg.get("model", "")
                 body = msg.get("content")
                 if isinstance(body, list):
-                    rec_agent["final_chars"] = sum(
-                        len(b.get("text", "") or "")
-                        for b in body if isinstance(b, dict) and b.get("type") == "text")
+                    chars = sum(len(b.get("text", "") or "")
+                                for b in body if isinstance(b, dict) and b.get("type") == "text")
+                    # Reporting through a delivery tool is the normal path, not a dead end.
+                    if any(isinstance(b, dict) and b.get("type") == "tool_use"
+                           and b.get("name") in DELIVERY_TOOLS for b in body):
+                        chars = max(chars, 800)
+                    rec_agent["final_chars"] = chars
 
         content = msg.get("content")
         if not isinstance(content, list):
@@ -256,15 +253,18 @@ def analyze(days=None):
             if btype == "tool_use":
                 name = block.get("name", "?")
                 tool_names[block.get("id")] = name
-                tool_inputs[block.get("id")] = block.get("input") or {}
+                raw_input = block.get("input")
+                tool_inputs[block.get("id")] = raw_input if isinstance(raw_input, dict) else {}
                 tool_calls[name] += 1
 
                 # Signature of what this call actually does, so an identical repeat is visible.
-                params = block.get("input") or {}
+                params = tool_inputs[block.get("id")]
                 if name == "Bash":
                     sig = f"Bash:{(params.get('command') or '')[:160]}"
                 elif name in ("Read", "Edit", "Write"):
-                    sig = f"{name}:{params.get('file_path','?')}"
+                    # Include the range: paging through a file is not repeating yourself.
+                    span = f"#{params.get('offset','')}:{params.get('limit','')}"
+                    sig = f"{name}:{params.get('file_path','?')}{span if span != '#:' else ''}"
                 elif name in ("Grep", "Glob"):
                     sig = f"{name}:{params.get('pattern','?')}:{params.get('path','')}"
                 else:
@@ -275,9 +275,9 @@ def analyze(days=None):
                                          name in PRODUCTIVE_TOOLS))
 
                 if name == "Read":
-                    params = block.get("input") or {}
                     path = params.get("file_path", "?")
-                    reads_per_agent[agent_key][path] += 1
+                    span = (params.get("offset"), params.get("limit"))
+                    reads_per_agent[agent_key][(path, span)] += 1
                     if params.get("limit") or params.get("offset"):
                         read_ranged += 1
                     else:
@@ -303,7 +303,7 @@ def analyze(days=None):
                     shape = normalize_command((tool_inputs.get(tid) or {}).get("command", ""))
                     cmd_failures[shape] += 1
                     cmd_sessions[shape].add(sid)
-                if text:
+                if text and is_error:
                     head = text[:4000]
                     for label, pattern in ERROR_PATTERNS:
                         if re.search(pattern, head):
@@ -320,7 +320,7 @@ def analyze(days=None):
     per_file = collections.defaultdict(
         lambda: {"views": 0, "rereads": 0, "agents": set(), "tokens": 0, "avg": 0})
     for agent, files in reads_per_agent.items():
-        for path, count in files.items():
+        for (path, _span), count in files.items():
             entry = per_file[path]
             entry["views"] += count
             entry["rereads"] += count - 1
@@ -441,7 +441,7 @@ def fmt(n):
     return f"{int(n):,}"
 
 
-def report(data, show_all=False, anonymous=False):
+def report(data):
     t = data["totals"]
     grand = sum(t.values())
     side = sum(data["sidechain_totals"].values())
@@ -539,7 +539,7 @@ def report(data, show_all=False, anonymous=False):
         print("-" * 74)
         print(f"  {'wasted':>9}{'avg size':>10}{'reads':>7}{'agents':>8}{'copies':>8}   file")
         for c in cands[:10]:
-            path = redact(c["path"]) if anonymous else c["path"]
+            path = c["path"]
             if len(path) > 40:
                 path = "..." + path[-37:]
             print(f"  {fmt(c['wasted_tokens']):>9}{fmt(c['avg_tokens']):>10}"
@@ -571,7 +571,6 @@ def report(data, show_all=False, anonymous=False):
             print("\n  Most-repeated calls:")
             for sig, n in loops["signatures"][:8]:
                 n_agents = loops["agents_by_sig"].get(sig, 1)
-                sig = redact_signature(sig) if anonymous else sig
                 shown = sig if len(sig) <= 58 else sig[:55] + "..."
                 print(f"    {n:>5}x by {n_agents:>3} agents   {shown}")
         if stalls["agents"]:
@@ -597,8 +596,7 @@ def report(data, show_all=False, anonymous=False):
     if cands:
         top = cands[0]
         recs.append(f"Split the files under SPLIT CANDIDATES. The worst is "
-                    f"`{redact(top['path']) if anonymous else top['path']}` — "
-                    f"{top['agents']} different agents read it "
+                    f"`{top['path']}` — {top['agents']} different agents read it "
                     f"{top['views']} times at ~{fmt(top['avg_tokens'])} tokens a read, burning "
                     f"~{fmt(top['wasted_tokens'])} tokens on repeat reads alone. A file this shape "
                     f"is answering narrow questions with a wide read; splitting it by "
@@ -665,12 +663,8 @@ def report(data, show_all=False, anonymous=False):
                     f"Read-only exploration rarely needs your largest model.")
     if not recs:
         recs.append("Nothing above the alarm thresholds. Your setup looks healthy.")
-    shown = recs if show_all else recs[:6]
-    for i, rec in enumerate(shown, 1):
+    for i, rec in enumerate(recs, 1):
         print(f"\n  {i}. {rec}")
-    if len(recs) > len(shown):
-        print(f"\n  ...and {len(recs) - len(shown)} smaller findings. Run with --all to see them, "
-              f"or fix these first and re-run.")
     print()
 
 
@@ -678,37 +672,25 @@ def main():
     ap = argparse.ArgumentParser(description="Find out where your Claude Code tokens actually go.")
     ap.add_argument("--days", type=int, help="only look at the last N days")
     ap.add_argument("--json", metavar="PATH", help="also write raw findings as JSON")
-    ap.add_argument("--all", action="store_true", help="show every recommendation, not just the top 6")
-    ap.add_argument("--redact", action="store_true",
-                    help="strip usernames, absolute paths and command arguments, for sharing")
     args = ap.parse_args()
+    if args.days is not None and args.days < 1:
+        ap.error("--days must be at least 1")
 
     data = analyze(args.days)
-    report(data, show_all=args.all, anonymous=args.redact)
+    report(data)
 
     if args.json:
         serializable = dict(data)
-        if args.redact:
-            # The JSON is the copy most likely to be pasted somewhere or handed to a service,
-            # so redact it on the same flag rather than leaving a raw file behind.
-            serializable["loops"] = dict(serializable["loops"])
-            serializable["loops"]["signatures"] = [
-                [redact_signature(sig), n] for sig, n in serializable["loops"]["signatures"]]
-            serializable["loops"]["agents_by_sig"] = {
-                redact_signature(k): v for k, v in serializable["loops"]["agents_by_sig"].items()}
-            serializable["split_candidates"] = [
-                {**c, "path": redact(c["path"])} for c in serializable["split_candidates"]]
-            serializable["cmd_failures"] = {
-                redact(k): v for k, v in serializable["cmd_failures"].items()}
-            serializable["cmd_sessions"] = {
-                redact(k): v for k, v in serializable["cmd_sessions"].items()}
         serializable["agents"] = [
             {k: v for k, v in a.items()}
             for a in sorted(data["agents"].values(), key=lambda x: -x["tokens"])[:50]
         ]
-        with open(args.json, "w") as fh:
-            json.dump(serializable, fh, indent=2)
-        print(f"  Raw findings written to {args.json}\n")
+        try:
+            with open(args.json, "w") as fh:
+                json.dump(serializable, fh, indent=2)
+            print(f"  Raw findings written to {args.json}\n")
+        except OSError as exc:
+            print(f"  Could not write {args.json}: {exc}\n")
 
 
 if __name__ == "__main__":
