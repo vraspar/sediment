@@ -20,9 +20,9 @@ python3 "$tmp/sediment/sediment.py" --json findings.json
 > summary is below. Turn this into specific changes. Do not give me general best practices —
 > I want fixes tied to the evidence.
 >
-> The audit covers every project on this machine, so group your findings by where the fix
-> belongs: my shell or environment, a particular repo, or how I run agents. Say which repo each
-> one is for. Make the changes you can reach from here and list the rest.
+> The audit covers every project on this machine. First sort findings into:
+> shell/environment, a specific repo, or how I run agents. Make the fixes you can reach from
+> here and list anything out of reach.
 >
 > Paste the sediment output here.
 >
@@ -39,8 +39,8 @@ python3 "$tmp/sediment/sediment.py" --json findings.json
 > · document it. A documentation line is the last resort, not the first, because agent docs are
 > advisory and cost tokens on every turn.
 >
-> **3. Audit the agent-facing docs for claims that are false.** Read every `CLAUDE.md`,
-> `AGENTS.md`, and skill file in the repos the findings point at. For each concrete claim — a command, a path, a file
+> **3. Audit the agent-facing docs for claims that are false.** Read every relevant
+> `CLAUDE.md`, `AGENTS.md`, and skill file in the repos the findings point at. For each concrete claim — a command, a path, a file
 > name, an environment variable, a config value, an architectural statement — check it against the
 > actual repo. List every claim that is wrong, with file:line, what it says, and what is actually
 > true. A wrong instruction costs an agent a failed run plus a recovery loop, so this usually

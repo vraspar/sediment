@@ -247,18 +247,19 @@ def analyze(days=None):
             out_by_bucket[label] += out
             turns_by_bucket[label] += 1
 
+            agent_spend[agent_key] += spent
+            still = []
+            for label, left, at_start in pending[agent_key]:
+                if left > 1:
+                    still.append((label, left - 1, at_start))
+                else:
+                    downstream[label] += agent_spend[agent_key] - at_start
+            pending[agent_key] = still
+
             if is_side:
                 rec_agent = agents[agent_key]
                 if rec_agent["turns"] == 0:
                     spawn_costs.append(ctx)
-                agent_spend[agent_key] += spent
-                still = []
-                for label, left, at_start in pending[agent_key]:
-                    if left > 1:
-                        still.append((label, left - 1, at_start))
-                    else:
-                        downstream[label] += agent_spend[agent_key] - at_start
-                pending[agent_key] = still
                 rec_agent["tokens"] += spent
                 rec_agent["turns"] += 1
                 rec_agent["out"] += out
@@ -362,6 +363,11 @@ def analyze(days=None):
                             break
                 if shape and shape not in examples:
                     examples[shape] = ((tool_inputs.get(tid) or {}).get("command", ""))[:110]
+
+    for agent_key, entries in pending.items():
+        final_spend = agent_spend[agent_key]
+        for label, _, at_start in entries:
+            downstream[label] += max(0, final_spend - at_start)
 
     reread = sum(sum(c - 1 for c in files.values() if c > 1) for files in reads_per_agent.values())
     total_reads = sum(sum(files.values()) for files in reads_per_agent.values())

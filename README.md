@@ -4,20 +4,20 @@ Find out where your Claude Code tokens go, then turn the waste into fixes.
 
 ## Copy This Into Claude Code
 
-Paste this into Claude Code. Run it wherever you can act on the most findings:
+Paste this into Claude Code from wherever you usually work:
 
 ```text
-Audit my Claude Code history end to end and tell me what to change.
+Use sediment to audit my Claude Code history and find fixes across my workspace.
 
 Run:
 tmp=$(mktemp -d)
 git clone https://github.com/vraspar/sediment "$tmp/sediment"
 python3 "$tmp/sediment/sediment.py" --json findings.json
 
-sediment reads every project on this machine, so the findings are about how I
-work, not about one repo. Group them by where the fix belongs: my shell or
-environment, a particular repo, or how I run agents. Say which repo each one is
-for. Make the changes you can reach from here and list the rest.
+sediment reads Claude Code history across every project on this machine. Group
+findings by where the fix belongs: shell/environment, a specific repo, or how I
+run agents. Make the fixes you can reach from here and list anything out of
+reach.
 
 Use findings.json and the printed report. For each recommendation, show:
 - the sediment evidence, including what it cost
@@ -29,12 +29,8 @@ instructions. If a docs change is still the best fix, replace stale text instead
 of appending another warning.
 ```
 
-That is the fastest path. The agent clones `sediment`, runs it, reads the report,
-and turns the findings into a plan.
-
-sediment audits **all** of your Claude Code history, every project on the
-machine. That is the point: recurring failures, long-lived agents and context
-habits are properties of how you work, not of one repo.
+That is the fastest path. The agent will clone `sediment`, run it, read the
+report, and turn the findings into a workspace-level plan.
 
 For a stricter review workflow, use [`PROMPT.md`](./PROMPT.md).
 
