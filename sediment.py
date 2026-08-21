@@ -197,6 +197,8 @@ def analyze(days=None):
     DOWNSTREAM_TURNS = 5
     pending = collections.defaultdict(list)      # agent -> [(label, turns_left, spend_at_start)]
     downstream = collections.Counter()           # label -> tokens spent after it appeared
+    billed = collections.defaultdict(set)        # label -> {(agent, turn index) already charged}
+    agent_turn = collections.Counter()           # agent -> turns seen so far
     examples = {}                                # label -> one real sample, for the report
     agent_spend = collections.Counter()          # agent -> running total
 
@@ -248,12 +250,18 @@ def analyze(days=None):
             turns_by_bucket[label] += 1
 
             agent_spend[agent_key] += spent
+            agent_turn[agent_key] += 1
+            turn_no = agent_turn[agent_key]
             still = []
-            for label, left, at_start in pending[agent_key]:
+            for sig_label, left, at_start in pending[agent_key]:
+                # Charge this turn once per signature even when several are open, so overlapping
+                # windows cannot bill the same tokens twice and push the total over 100%.
+                key = (agent_key, turn_no)
+                if key not in billed[sig_label]:
+                    billed[sig_label].add(key)
+                    downstream[sig_label] += spent
                 if left > 1:
-                    still.append((label, left - 1, at_start))
-                else:
-                    downstream[label] += agent_spend[agent_key] - at_start
+                    still.append((sig_label, left - 1, at_start))
             pending[agent_key] = still
 
             if is_side:
@@ -340,7 +348,8 @@ def analyze(days=None):
                 shape = None
                 if is_error and name == "Bash":
                     shape = normalize_command((tool_inputs.get(tid) or {}).get("command", ""))
-                    if shape.split()[0] in EXIT_1_IS_NORMAL and not text.strip():
+                    body = re.sub(r"^\s*Exit code \d+\s*", "", text).strip()
+                    if shape.split()[0] in EXIT_1_IS_NORMAL and not body:
                         # A search that printed nothing and exited non-zero found nothing.
                         is_error = False
                         shape = None
@@ -357,17 +366,16 @@ def analyze(days=None):
                             pending[agent_key].append(
                                 (label, DOWNSTREAM_TURNS, agent_spend[agent_key]))
                             if label not in examples:
-                                line = next((ln.strip() for ln in head.splitlines()
-                                             if found.group(0)[:20] in ln), found.group(0))
-                                examples[label] = line[:110]
+                                # Keep only what the pattern matched. Whole lines carried absolute
+                                # paths and, in one real case, a keychain lookup with a wallet
+                                # address, and the report is meant to be pasted to an agent.
+                                examples[label] = found.group(0)[:80]
                             break
-                if shape and shape not in examples:
-                    examples[shape] = ((tool_inputs.get(tid) or {}).get("command", ""))[:110]
 
-    for agent_key, entries in pending.items():
-        final_spend = agent_spend[agent_key]
-        for label, _, at_start in entries:
-            downstream[label] += max(0, final_spend - at_start)
+
+    # Anything still open when the input ends already had every turn it saw charged above, so
+    # there is nothing left to flush; the entries simply expire.
+    pending.clear()
 
     reread = sum(sum(c - 1 for c in files.values() if c > 1) for files in reads_per_agent.values())
     total_reads = sum(sum(files.values()) for files in reads_per_agent.values())
@@ -617,19 +625,16 @@ def report(data):
         print("  'wasted' is tokens spent on reads after the first, which is what a split recovers.")
 
     if data["cmd_failures"]:
-        eg = data.get("examples") or {}
         print("\n  Failing command shapes:")
         for shape, n in sorted(data["cmd_failures"].items(), key=lambda kv: -kv[1])[:8]:
             print(f"    {n:>5} failures across {data['cmd_sessions'].get(shape,0):>3} sessions   {shape}")
-            if eg.get(shape):
-                print(f"          e.g. {eg[shape]}")
 
     if data["error_hits"]:
         down = data.get("downstream") or {}
         eg = data.get("examples") or {}
         print("\n  Error signatures, by what the agent spent in the 5 turns after each:")
         ranked = sorted(data["error_hits"].items(), key=lambda kv: -down.get(kv[0], 0))
-        for label, n in ranked[:8]:
+        for label, n in ranked[:10]:
             cost = down.get(label, 0)
             print(f"    {fmt(cost):>14} tok  {n:>5} hits / {data['error_sessions'].get(label,0):>3} "
                   f"sessions   {label}")
