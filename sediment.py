@@ -361,7 +361,7 @@ def analyze(days=None):
     split_candidates = [
         {"path": key, "views": g["views"], "rereads": g["rereads"],
          "agents": len(g["agents"]), "avg_tokens": g["avg"],
-         "wasted_tokens": g["tokens"], "copies": len(g["copies"])}
+         "wasted_tokens": g["tokens"], "checkouts": len(g["copies"])}
         for key, g in grouped.items()
         if g["rereads"] >= 3 and len(g["agents"]) >= 2 and g["avg"] >= 400
     ]
@@ -564,7 +564,7 @@ def report(data):
             if len(path) > 40:
                 path = "..." + path[-37:]
             print(f"  {fmt(c['wasted_tokens']):>9}{fmt(c['avg_tokens']):>10}"
-                  f"{c['views']:>7}{c['agents']:>8}{c['copies']:>8}   {path}")
+                  f"{c['views']:>7}{c['agents']:>8}{c['checkouts']:>10}   {path}")
         total_wasted = sum(c["wasted_tokens"] for c in cands)
         print(f"\n  {len(cands)} files fit the pattern; re-reading them cost ~{fmt(total_wasted)} tokens.")
         print("  'wasted' is tokens spent on reads after the first, which is what a split recovers.")
