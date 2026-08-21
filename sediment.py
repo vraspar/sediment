@@ -90,12 +90,22 @@ def is_throwaway(path):
 def group_key(path):
     """Collapse the same file checked out in several worktrees into one entry.
 
-    Git worktrees give one source file many absolute paths, which would otherwise split its
-    cost across a dozen rows and hide how expensive it really is. The last two path components
-    identify it well enough in practice.
+    Git worktrees give one source file many absolute paths, which would otherwise split its cost
+    across a dozen rows and hide how expensive it really is. Keying on the trailing components
+    alone would go too far the other way and merge same-named files from different repositories,
+    so the key keeps everything below the checkout directory: for a worktree the checkout name
+    varies while the path under it does not, and two repositories that both hold lib/server.ts
+    stay apart because the rest of their paths differ.
     """
     parts = [p for p in path.split(os.sep) if p]
-    return os.sep.join(parts[-2:]) if len(parts) >= 2 else path
+    if len(parts) < 2:
+        return path
+    # Find the deepest directory that looks like a source root and key on everything under it.
+    for marker in ("src", "lib", "app", "packages", "tests", "test", "docs", "scripts"):
+        if marker in parts[:-1]:
+            idx = len(parts) - 1 - parts[::-1].index(marker)
+            return os.sep.join(parts[idx:])
+    return os.sep.join(parts[-2:])
 
 
 def bucket_of(ctx):
@@ -380,6 +390,10 @@ def analyze(days=None):
         for sig, n in counts.items():
             if n >= LOOP_MIN:
                 loops.append((agent, sig, n))
+        # An Explore or review agent never edits by design; a long unproductive run is its
+        # normal shape, not a stall. Only agents that do edit somewhere can be said to stall.
+        if not any(productive for _, productive in steps):
+            continue
         run = best = 0
         for _, productive in steps:
             run = 0 if productive else run + 1
@@ -566,7 +580,8 @@ def report(data):
         print("  LOOPS AND STALLS — agents repeating themselves or making no progress")
         print("-" * 74)
         if loops["signatures"]:
-            print(f"  {loops['agents_looping']} of {data['agent_count']} agents repeated an identical "
+            print(f"  {loops['agents_looping']} of {data['agent_count']} agents and sessions "
+                  f"repeated an identical "
                   f"call 3+ times ({loops['total_repeats']:,} redundant calls total).")
             print("\n  Most-repeated calls:")
             for sig, n in loops["signatures"][:8]:
@@ -574,7 +589,7 @@ def report(data):
                 shown = sig if len(sig) <= 58 else sig[:55] + "..."
                 print(f"    {n:>5}x by {n_agents:>3} agents   {shown}")
         if stalls["agents"]:
-            print(f"\n  {stalls['agents']} agents went 25+ consecutive tool calls without editing "
+            print(f"\n  {stalls['agents']} editing agents went 25+ consecutive tool calls without editing "
                   f"a file.")
             print(f"  Longest such stretch: {stalls['worst']} calls with nothing changed.")
 
