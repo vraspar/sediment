@@ -665,9 +665,6 @@ def report(data, show_all=False, anonymous=False):
                     f"Read-only exploration rarely needs your largest model.")
     if not recs:
         recs.append("Nothing above the alarm thresholds. Your setup looks healthy.")
-    if not anonymous:
-        print("\n  This report quotes real command lines and absolute paths from your machine.")
-        print("  Re-run with --redact before pasting it anywhere public.")
     shown = recs if show_all else recs[:6]
     for i, rec in enumerate(shown, 1):
         print(f"\n  {i}. {rec}")
