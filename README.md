@@ -11,10 +11,11 @@ It is deliberately small: one Python file, no install step, no dependencies, no
 network calls, no API key, and no account. It reads transcripts on your machine
 and prints a report.
 
-It audits **all** of your Claude Code history, every project on the machine, not
-whichever repo you happen to run it from. That is the point — the patterns worth
-finding show up across projects — but it means the report names files, branches
-and commands from everything you have worked on.
+It audits **all** of your Claude Code history, across every project on the
+machine, not just the repo you run it from. That is intentional: recurring
+failures, long-lived agents, and context habits usually cross repo boundaries.
+When you use the report to improve one repo, treat findings from other repos as
+context, not as local files to fix.
 
 ## Quick Start
 
@@ -22,7 +23,8 @@ Get it and run it:
 
 ```bash
 git clone https://github.com/vraspar/sediment
-python3 sediment/sediment.py
+cd sediment
+python3 sediment.py
 ```
 
 For a recent window:
@@ -49,12 +51,12 @@ gigabyte.
 Paste this into Claude Code from the repo you want to improve:
 
 ```text
-Audit my Claude Code token history end to end and find fixes for this repo.
+Audit my Claude Code token history end to end, then find fixes for this repo.
 
 sediment reads all of my Claude Code history across every project, so some
 findings will name files and repos other than this one. Use those only as
-context; propose changes only for this repo, and say so when a finding belongs
-somewhere else.
+context. Propose changes only for this repo, and say explicitly when a finding
+belongs somewhere else.
 
 Run:
 tmp=$(mktemp -d)
