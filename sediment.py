@@ -69,6 +69,30 @@ ERROR_PATTERNS = [
 # Tool calls that change something. Used to tell real progress from spinning.
 PRODUCTIVE_TOOLS = {"Edit", "Write", "NotebookEdit", "MultiEdit"}
 
+# Files nobody can restructure: scratch output, generated dumps, vendored code. Reading these
+# repeatedly may still be wasteful, but "split this file" is not the fix, so they are excluded
+# from split candidates rather than offered as advice that cannot be taken.
+THROWAWAY_DIRS = ("/scratchpad/", "/tmp/", "/.git/", "/node_modules/", "/dist/", "/build/",
+                  "/vendor/", "/.venv/", "/site-packages/", "/coverage/", "/__pycache__/")
+THROWAWAY_EXTS = (".diff", ".patch", ".log", ".lock", ".min.js", ".map", ".snap", ".csv")
+
+
+def is_throwaway(path):
+    lowered = path.lower()
+    return (any(d in lowered for d in THROWAWAY_DIRS)
+            or lowered.endswith(THROWAWAY_EXTS))
+
+
+def group_key(path):
+    """Collapse the same file checked out in several worktrees into one entry.
+
+    Git worktrees give one source file many absolute paths, which would otherwise split its
+    cost across a dozen rows and hide how expensive it really is. The last two path components
+    identify it well enough in practice.
+    """
+    parts = [p for p in path.split(os.sep) if p]
+    return os.sep.join(parts[-2:]) if len(parts) >= 2 else path
+
 
 def bucket_of(ctx):
     for lo, hi, label in BUCKETS:
@@ -134,6 +158,8 @@ def analyze(days=None):
 
     reads_per_agent = collections.defaultdict(collections.Counter)
     read_no_range = read_ranged = 0
+    read_tokens_by_file = collections.Counter()   # path -> tokens returned across all reads
+    read_counts_by_file = collections.Counter()   # path -> how many reads returned content
 
     cmd_failures = collections.Counter()
     cmd_sessions = collections.defaultdict(set)
@@ -239,6 +265,10 @@ def analyze(days=None):
                 elif isinstance(raw, list):
                     text = "".join(x.get("text", "") or "" for x in raw if isinstance(x, dict))
                 tool_bytes[name] += len(text)
+                if name == "Read" and text:
+                    path = (tool_inputs.get(tid) or {}).get("file_path", "?")
+                    read_tokens_by_file[path] += len(text) // 4
+                    read_counts_by_file[path] += 1
 
                 is_error = block.get("is_error") or False
                 if is_error and name == "Bash":
@@ -255,6 +285,44 @@ def analyze(days=None):
 
     reread = sum(sum(c - 1 for c in files.values() if c > 1) for files in reads_per_agent.values())
     total_reads = sum(sum(files.values()) for files in reads_per_agent.values())
+
+    # Split candidates. A file that many DIFFERENT agents open in full, repeatedly, is a file
+    # whose structure forces a wide read for a narrow question. Rank by tokens spent re-reading,
+    # because that is the part splitting the file actually recovers.
+    per_file = collections.defaultdict(
+        lambda: {"views": 0, "rereads": 0, "agents": set(), "tokens": 0, "avg": 0})
+    for agent, files in reads_per_agent.items():
+        for path, count in files.items():
+            entry = per_file[path]
+            entry["views"] += count
+            entry["rereads"] += count - 1
+            entry["agents"].add(agent)
+    for path, entry in per_file.items():
+        entry["avg"] = int(read_tokens_by_file[path] / max(read_counts_by_file[path], 1))
+        entry["tokens"] = entry["avg"] * entry["rereads"]
+    # Two corrections before ranking. Throwaway artifacts cannot be "split", and the same source
+    # file checked out in several worktrees is one file whose costs belong added together.
+    grouped = collections.defaultdict(
+        lambda: {"views": 0, "rereads": 0, "agents": set(), "tokens": 0, "avg": 0, "copies": set()})
+    for path, entry in per_file.items():
+        if is_throwaway(path):
+            continue
+        key = group_key(path)
+        g = grouped[key]
+        g["views"] += entry["views"]
+        g["rereads"] += entry["rereads"]
+        g["agents"] |= entry["agents"]
+        g["tokens"] += entry["tokens"]
+        g["avg"] = max(g["avg"], entry["avg"])
+        g["copies"].add(path)
+    split_candidates = [
+        {"path": key, "views": g["views"], "rereads": g["rereads"],
+         "agents": len(g["agents"]), "avg_tokens": g["avg"],
+         "wasted_tokens": g["tokens"], "copies": len(g["copies"])}
+        for key, g in grouped.items()
+        if g["rereads"] >= 3 and len(g["agents"]) >= 2 and g["avg"] >= 400
+    ]
+    split_candidates.sort(key=lambda d: -d["wasted_tokens"])
 
     # Resolve the traces into loops and stalls.
     LOOP_MIN = 3      # an identical call this many times over is a loop, not a retry
@@ -296,6 +364,7 @@ def analyze(days=None):
             "whole_file": read_no_range,
             "ranged": read_ranged,
         },
+        "split_candidates": split_candidates[:40],
         "cmd_failures": dict(cmd_failures),
         "cmd_sessions": {k: len(v) for k, v in cmd_sessions.items()},
         "error_hits": dict(error_hits),
@@ -400,6 +469,22 @@ def report(data):
         print(f"  Reads with no offset/limit (whole file):        {r['whole_file']:,} of "
               f"{r['whole_file']+r['ranged']:,} ({100*r['whole_file']/max(r['whole_file']+r['ranged'],1):.0f}%)")
 
+    cands = data.get("split_candidates") or []
+    if cands:
+        print("\n" + "-" * 74)
+        print("  SPLIT CANDIDATES — files whose shape forces a wide read for a narrow question")
+        print("-" * 74)
+        print(f"  {'wasted':>9}{'avg size':>10}{'reads':>7}{'agents':>8}{'copies':>8}   file")
+        for c in cands[:10]:
+            path = c["path"]
+            if len(path) > 40:
+                path = "..." + path[-37:]
+            print(f"  {fmt(c['wasted_tokens']):>9}{fmt(c['avg_tokens']):>10}"
+                  f"{c['views']:>7}{c['agents']:>8}{c['copies']:>8}   {path}")
+        total_wasted = sum(c["wasted_tokens"] for c in cands)
+        print(f"\n  {len(cands)} files fit the pattern; re-reading them cost ~{fmt(total_wasted)} tokens.")
+        print("  'wasted' is tokens spent on reads after the first, which is what a split recovers.")
+
     if data["cmd_failures"]:
         print("\n  Failing command shapes:")
         for shape, n in sorted(data["cmd_failures"].items(), key=lambda kv: -kv[1])[:8]:
@@ -445,10 +530,19 @@ def report(data):
         n = sum(1 for a in agents.values() if a["peak"] > 600_000)
         recs.append(f"{n} agent(s) exceeded 600k context. Check what they were doing; agents that "
                     f"run for hundreds of turns usually needed to be several agents.")
-    if r["total"] and 100 * r["reread"] / r["total"] > 25:
-        recs.append(f"{100*r['reread']/r['total']:.0f}% of reads re-open a file the agent already read. "
-                    f"Usually means the file is too big to answer one question, so it gets re-read "
-                    f"instead of remembered. Split the files that show up most.")
+    if cands:
+        top = cands[0]
+        recs.append(f"Split the files under SPLIT CANDIDATES. The worst is "
+                    f"`{top['path']}` — {top['agents']} different agents read it "
+                    f"{top['views']} times at ~{fmt(top['avg_tokens'])} tokens a read, burning "
+                    f"~{fmt(top['wasted_tokens'])} tokens on repeat reads alone. A file this shape "
+                    f"is answering narrow questions with a wide read; splitting it by "
+                    f"responsibility, or adding a table of contents with line ranges, lets an agent "
+                    f"ask for the part it needs.")
+    elif r["total"] and 100 * r["reread"] / r["total"] > 25:
+        recs.append(f"{100*r['reread']/r['total']:.0f}% of reads re-open a file the agent already "
+                    f"read, but no single file dominates. That points at reading habits rather than "
+                    f"file structure.")
     if r["whole_file"] and 100 * r["whole_file"] / max(r["whole_file"] + r["ranged"], 1) > 50:
         recs.append("Most reads pull whole files. Adding a table of contents with line ranges to "
                     "your largest files lets an agent ask for the part it needs.")
