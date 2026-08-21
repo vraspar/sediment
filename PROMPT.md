@@ -17,13 +17,12 @@ python3 "$tmp/sediment/sediment.py" --json findings.json
 ## The prompt
 
 > I ran a token audit on my Claude Code history. The findings are in `findings.json`, and the
-> summary is below. I want you to turn this into specific changes to this repo. Do not give me
-> general best practices — I want fixes tied to the evidence.
+> summary is below. Turn this into specific changes. Do not give me general best practices —
+> I want fixes tied to the evidence.
 >
-> The audit covers every project on my machine, so some findings name files, repos, and
-> branches that do not exist here. Treat those as context about how I work, not as things to
-> fix in this repo. Say explicitly which findings belong somewhere else, and do not propose
-> local changes for them.
+> The audit covers every project on this machine. First sort findings into:
+> shell/environment, a specific repo, or how I run agents. Make the fixes you can reach from
+> here and list anything out of reach.
 >
 > Paste the sediment output here.
 >
@@ -40,8 +39,8 @@ python3 "$tmp/sediment/sediment.py" --json findings.json
 > · document it. A documentation line is the last resort, not the first, because agent docs are
 > advisory and cost tokens on every turn.
 >
-> **3. Audit the agent-facing docs for claims that are false.** Read every `CLAUDE.md`,
-> `AGENTS.md`, and skill file in this repo. For each concrete claim — a command, a path, a file
+> **3. Audit the agent-facing docs for claims that are false.** Read every relevant
+> `CLAUDE.md`, `AGENTS.md`, and skill file in the repos the findings point at. For each concrete claim — a command, a path, a file
 > name, an environment variable, a config value, an architectural statement — check it against the
 > actual repo. List every claim that is wrong, with file:line, what it says, and what is actually
 > true. A wrong instruction costs an agent a failed run plus a recovery loop, so this usually

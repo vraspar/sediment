@@ -4,23 +4,24 @@ Find out where your Claude Code tokens go, then turn the waste into fixes.
 
 ## Copy This Into Claude Code
 
-Open the repo you want to improve, then paste:
+Paste this into Claude Code from wherever you usually work:
 
 ```text
-Use sediment to audit my Claude Code history and find fixes for this repo.
+Use sediment to audit my Claude Code history and find fixes across my workspace.
 
 Run:
 tmp=$(mktemp -d)
 git clone https://github.com/vraspar/sediment "$tmp/sediment"
 python3 "$tmp/sediment/sediment.py" --json findings.json
 
-sediment reads Claude Code history across every project on this machine. Some
-findings may belong to other repos. Use those as context only. Propose changes
-only for this repo, and say when a finding does not apply here.
+sediment reads Claude Code history across every project on this machine. Group
+findings by where the fix belongs: shell/environment, a specific repo, or how I
+run agents. Make the fixes you can reach from here and list anything out of
+reach.
 
 Use findings.json and the printed report. For each recommendation, show:
-- the sediment evidence
-- what you checked in this repo
+- the sediment evidence, including what it cost
+- what you checked, and where
 - the smallest fix that should work
 
 Prefer fixing code, environment, hooks, or lint rules over adding more agent
@@ -29,7 +30,7 @@ of appending another warning.
 ```
 
 That is the fastest path. The agent will clone `sediment`, run it, read the
-report, and turn the findings into a repo-specific plan.
+report, and turn the findings into a workspace-level plan.
 
 For a stricter review workflow, use [`PROMPT.md`](./PROMPT.md).
 
