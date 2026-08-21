@@ -35,9 +35,17 @@ BUCKETS = [
     (600_000, 10**9, ">600k"),
 ]
 
-# Error signatures worth attributing downstream burn to. Ordered most to least specific
-# so the first match wins. Deliberately spans several ecosystems: the point is to work on
-# somebody else's stack, not only the one this was written against.
+# Error signatures, matched only against results the harness marked as failures. Ordered most
+# to least specific so the first match wins, and deliberately spanning several ecosystems.
+#
+# Every pattern here matches text that appears only when something failed, never a word that
+# also appears in ordinary output about the same subject: "testcontainer" shows up in passing
+# test names, "eslint" in directory listings. Matching those inflated the table roughly twenty
+# fold before this was tightened.
+#
+# The table undercounts, deliberately. A command that fails inside a pipeline, or reports
+# failures in its output while still exiting zero, is not marked as an error by the harness and
+# is not counted here. Overcounting was the worse failure: it made the report confidently wrong.
 ERROR_PATTERNS = [
     # Shell and environment
     ("shell glob not expanded", r"no matches found:|nomatch|bad pattern:"),
@@ -47,23 +55,25 @@ ERROR_PATTERNS = [
     ("command timed out", r"command timed out|timed out after|ETIMEDOUT"),
     ("port already in use", r"EADDRINUSE|address already in use|port .* already"),
     # Test runners, several ecosystems
-    ("test failure (js)", r"FAIL\s+\S+|Tests?:\s+\d+\s+failed|✕ |● .*›"),
-    ("test failure (python)", r"=+ FAILURES =+|\d+ failed,|E\s+assert |pytest"),
+    ("test failure (js)", r"FAIL\s+\S+|Tests?:?\s+\d+\s+failed|✕ |● .*›"),
+    ("test failure (python)", r"=+ FAILURES =+|\d+ failed[,\s]|E\s+assert "),
     ("test failure (go)", r"^--- FAIL|FAIL\s+\S+\s+\d+\.\d+s"),
     ("test failure (rust/other)", r"test result: FAILED|thread '.*' panicked"),
     # Build and type systems
     ("type error", r"error TS\d{4}|mypy: |error\[E\d+\]|type error:"),
-    ("lint failure", r"\d+ problems? \(\d+ error|eslint|ruff|rubocop.*offense"),
+    ("lint failure", r"\d+ problems? \(\d+ error|✖ \d+ problem|rubocop.*\d+ offense"),
     ("package script failure", r"ELIFECYCLE|command failed with exit code|npm ERR!|make: \*\*\*"),
     ("dependency resolution", r"ERESOLVE|could not resolve dependency|version solving failed"),
     # Infra
-    ("container / docker", r"testcontainer|docker.*(daemon|not running)|Cannot connect to the Docker"),
+    ("container / docker", r"Could not find a working container runtime|"
+                           r"docker.*(daemon is not running|Cannot connect)|"
+                           r"Cannot connect to the Docker"),
     ("database connection", r"ECONNREFUSED.*(5432|3306|27017)|could not connect to server|connection refused"),
     # Version control
     ("git conflict or dirty tree", r"CONFLICT|would be overwritten|Your local changes"),
-    ("git worktree/branch exists", r"already exists|is already checked out"),
+    ("git worktree/branch exists", r"fatal:.*already exists|is already checked out"),
     # Agent-harness specific
-    ("edit target missing", r"String to replace not found|has not been read yet|old_string"),
+    ("edit target missing", r"String to replace not found|has not been read yet"),
 ]
 
 # Commands that exit non-zero to mean "no match" rather than "something broke". The harness
@@ -345,6 +355,11 @@ def analyze(days=None):
                     read_counts_by_file[path] += 1
 
                 is_error = block.get("is_error") or False
+                if is_error:
+                    cmd = (tool_inputs.get(tid) or {}).get("command", "") or ""
+                    if re.search(r"\|\s*(head|tail|grep|rg|wc|sort|uniq|cut|awk)\b", cmd):
+                        # The exit came from the last stage of the pipe, not from the work.
+                        is_error = False
                 shape = None
                 if is_error and name == "Bash":
                     shape = normalize_command((tool_inputs.get(tid) or {}).get("command", ""))
