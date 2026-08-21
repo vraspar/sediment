@@ -48,19 +48,19 @@ BUCKETS = [
 # is not counted here. Overcounting was the worse failure: it made the report confidently wrong.
 ERROR_PATTERNS = [
     # Shell and environment
-    ("shell glob not expanded", r"no matches found:|nomatch|bad pattern:"),
+    ("shell glob not expanded", r"no matches found:|zsh: bad pattern:"),
     ("command not found", r"command not found|is not recognized as an internal"),
     ("permission / approval", r"[Pp]ermission denied|requires approval|EACCES|not permitted"),
     ("file not found", r"No such file or directory|ENOENT"),
     ("command timed out", r"command timed out|timed out after|ETIMEDOUT"),
-    ("port already in use", r"EADDRINUSE|address already in use|port .* already"),
+    ("port already in use", r"EADDRINUSE|address already in use|port \d+ is already"),
     # Test runners, several ecosystems
-    ("test failure (js)", r"FAIL\s+\S+|Tests?:?\s+\d+\s+failed|✕ |● .*›"),
+    ("test failure (js)", r"^\s*FAIL\s+\S+|Tests?:?\s+\d+\s+failed|✕ |● .*›"),
     ("test failure (python)", r"=+ FAILURES =+|\d+ failed[,\s]|E\s+assert "),
     ("test failure (go)", r"^--- FAIL|FAIL\s+\S+\s+\d+\.\d+s"),
     ("test failure (rust/other)", r"test result: FAILED|thread '.*' panicked"),
     # Build and type systems
-    ("type error", r"error TS\d{4}|mypy: |error\[E\d+\]|type error:"),
+    ("type error", r"error TS\d{4}|mypy: error:|error\[E\d+\]|type error:"),
     ("lint failure", r"\d+ problems? \(\d+ error|✖ \d+ problem|rubocop.*\d+ offense"),
     ("package script failure", r"ELIFECYCLE|command failed with exit code|npm ERR!|make: \*\*\*"),
     ("dependency resolution", r"ERESOLVE|could not resolve dependency|version solving failed"),
@@ -208,6 +208,8 @@ def analyze(days=None):
     pending = collections.defaultdict(list)      # agent -> [(label, turns_left, spend_at_start)]
     downstream = collections.Counter()           # label -> tokens spent after it appeared
     billed = collections.defaultdict(set)        # label -> {(agent, turn index) already charged}
+    billed_any = set()                           # every (agent, turn) charged by any label
+    downstream_total = [0]                       # corpus-wide, each turn counted once
     agent_turn = collections.Counter()           # agent -> turns seen so far
     examples = {}                                # label -> one real sample, for the report
     agent_spend = collections.Counter()          # agent -> running total
@@ -270,6 +272,9 @@ def analyze(days=None):
                 if key not in billed[sig_label]:
                     billed[sig_label].add(key)
                     downstream[sig_label] += spent
+                if key not in billed_any:
+                    billed_any.add(key)
+                    downstream_total[0] += spent
                 if left > 1:
                     still.append((sig_label, left - 1, at_start))
             pending[agent_key] = still
@@ -355,14 +360,9 @@ def analyze(days=None):
                     read_counts_by_file[path] += 1
 
                 is_error = block.get("is_error") or False
-                if is_error:
-                    cmd = (tool_inputs.get(tid) or {}).get("command", "") or ""
-                    if re.search(r"\|\s*(head|tail|grep|rg|wc|sort|uniq|cut|awk)\b", cmd):
-                        # The exit came from the last stage of the pipe, not from the work.
-                        is_error = False
                 shape = None
                 if is_error and name == "Bash":
-                    shape = normalize_command((tool_inputs.get(tid) or {}).get("command", ""))
+                    shape = normalize_command((tool_inputs.get(tid) or {}).get("command") or "")
                     body = re.sub(r"^\s*Exit code \d+\s*", "", text).strip()
                     if shape.split()[0] in EXIT_1_IS_NORMAL and not body:
                         # A search that printed nothing and exited non-zero found nothing.
@@ -374,7 +374,7 @@ def analyze(days=None):
                 if text and is_error:
                     head = text[:4000]
                     for label, pattern in ERROR_PATTERNS:
-                        found = re.search(pattern, head)
+                        found = re.search(pattern, head, re.MULTILINE)
                         if found:
                             error_hits[label] += 1
                             error_sessions[label].add(sid)
@@ -509,6 +509,7 @@ def analyze(days=None):
         "cmd_failures": dict(cmd_failures),
         "cmd_sessions": {k: len(v) for k, v in cmd_sessions.items()},
         "downstream": dict(downstream),
+        "downstream_total": downstream_total[0],
         "examples": dict(examples),
         "error_hits": dict(error_hits),
         "error_sessions": {k: len(v) for k, v in error_sessions.items()},
@@ -655,7 +656,7 @@ def report(data):
                   f"sessions   {label}")
             if eg.get(label):
                 print(f"                     e.g. {eg[label]}")
-        total_down = sum(down.get(k, 0) for k in data["error_hits"])
+        total_down = data.get("downstream_total", 0)
         if grand:
             print(f"\n  All error signatures together: {fmt(total_down)} tokens, "
                   f"{100*total_down/grand:.1f}% of everything. Attribution, not proof.")
